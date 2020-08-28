@@ -21,6 +21,11 @@
             "date": "132402817714110148"
         },
         {
+            "path": "SimObjects/AirPlanes/Asobo_A320_NEO/aircraft.cfg",
+            "size": 10060,
+            "date": "132402817714110148"
+        },
+        {
             "path": "SimObjects/AirPlanes/Asobo_A320_NEO/approach.FLT",
             "size": 4089,
             "date": "132402817714110148"
@@ -46,8 +51,23 @@
             "date": "132402817714110148"
         },
         {
+            "path": "SimObjects/AirPlanes/Asobo_A320_NEO/flight_model.cfg",
+            "size": 27583,
+            "date": "132402817714110148"
+        },
+        {
             "path": "SimObjects/AirPlanes/Asobo_A320_NEO/model/A320_NEO_INTERIOR.xml",
             "size": 133336,
+            "date": "132402817714110148"
+        },
+        {
+            "path": "SimObjects/AirPlanes/Asobo_A320_NEO/panel/FBW.wasm",
+            "size": 35138,
+            "date": "132402817714110148"
+        },
+        {
+            "path": "SimObjects/AirPlanes/Asobo_A320_NEO/panel/panel.cfg",
+            "size": 2590,
             "date": "132402817714110148"
         },
         {

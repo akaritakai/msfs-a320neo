@@ -2,4 +2,5 @@
 !*/
 !/A32NX/**
 !.gitignore
+!/WASM/**
 .DS_Store

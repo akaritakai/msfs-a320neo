@@ -100,6 +100,7 @@ void HandleControlSurfaces()
 	control_surfaces.elevator = user_input.yoke_y;
 	control_surfaces.aileron = user_input.yoke_x;
 	control_surfaces.rudder = user_input.rudder;
+	//printf("A32NX_FBW: Elevator %lf, Aileron %lf, Rudder %lf\n", control_surfaces.elevator, control_surfaces.aileron, control_surfaces.rudder);
 	SimConnect_SetDataOnSimObject(hSimConnect, CONTROL_SURFACES_DEFINITION, SIMCONNECT_OBJECT_ID_USER, 0, 0, sizeof(control_surfaces), &control_surfaces);
 }
 
@@ -111,20 +112,20 @@ void CALLBACK OnSimConnectEvent(SIMCONNECT_RECV* pData, DWORD cbData, void *pCon
 		switch (evt->uEventID)
 		{
 			case AXIS_ELEVATOR_SET_EVENT:
-				user_input.yoke_y = 0 - (static_cast<double>(evt->dwData) / 16384.0); // scale from [-16384,16384] to [-1,1] and reverse the sign
+				user_input.yoke_y = 0 - (static_cast<long>(evt->dwData) / 16384.0); // scale from [-16384,16384] to [-1,1] and reverse the sign
 				break;
 			case AXIS_AILERONS_SET_EVENT:
-				user_input.yoke_x = static_cast<double>(evt->dwData) / 16384.0; // scale from [-16384,16384] to [-1,1]
+				user_input.yoke_x = 0 - (static_cast<long>(evt->dwData) / 16384.0); // scale from [-16384,16384] to [-1,1] and reverse the sign
 				break;
 			case CENTER_AILERONS_RUDDER_EVENT:
 				user_input.yoke_x = 0;
 				user_input.rudder = 0;
 				break;
 			case AXIS_RUDDER_SET_EVENT:
-				user_input.rudder = static_cast<double>(evt->dwData) / 16384.0; // scale from [-16384,16384] to [-1,1]
+				user_input.rudder = 0 - (static_cast<long>(evt->dwData) / 16384.0); // scale from [-16384,16384] to [-1,1] and reverse the sign
 				break;
 			case RUDDER_SET_EVENT:
-				user_input.rudder = static_cast<double>(evt->dwData) / 16384.0; // scale from [-16384,16384] to [-1,1]
+				user_input.rudder = 0 - (static_cast<long>(evt->dwData) / 16384.0); // scale from [-16384,16384] to [-1,1] and reverse the sign
 				break;
 			case RUDDER_CENTER_EVENT:
 				user_input.rudder = 0;
@@ -142,6 +143,7 @@ extern "C"
 		case PANEL_SERVICE_PRE_INSTALL:
 		{
 			// Sent before the gauge is installed.
+			printf("A32NX_FBW: Installing\n");
 			return true; // TODO: Determine if this is this necessary? The reference gauges have this. Does this indicate a successful install?
 		}
 		case PANEL_SERVICE_POST_INSTALL:
@@ -151,12 +153,12 @@ extern "C"
 			// Connect to sim using SimConnect
 			if (SUCCEEDED(SimConnect_Open(&hSimConnect, "A32NX_FBW", nullptr, 0, 0, 0)))
 			{
-				printf("A32NX_FBW: Connected via SimConnect");
+				printf("A32NX_FBW: Connected via SimConnect\n");
 				RegisterSimVars();
 				RegisterInputCapture();
 				return true;
 			}
-			printf("A32NX_FBW: Failed to connect via SimConnect");
+			printf("A32NX_FBW: Failed to connect via SimConnect\n");
 			return false;
 		}
 		case PANEL_SERVICE_PRE_DRAW:

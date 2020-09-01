@@ -56,6 +56,16 @@
             "date": "132402817714110148"
         },
         {
+            "path": "SimObjects/AirPlanes/Asobo_A320_NEO/panel/A32NX.wasm",
+            "size": 45415,
+            "date": "132402817714110148"
+        },
+        {
+            "path": "SimObjects/AirPlanes/Asobo_A320_NEO/panel/panel.cfg",
+            "size": 2594,
+            "date": "132402817714110148"
+        },
+        {
             "path": "SimObjects/AirPlanes/Asobo_A320_NEO/panel/panel.xml",
             "size": 25898,
             "date": "132402817714110148"

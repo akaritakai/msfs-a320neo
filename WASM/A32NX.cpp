@@ -92,7 +92,7 @@ struct SIM_VARS
 	ENUM vertical_speed; // VERTICAL SPEED
 } sim_vars;
 
-bool HandleSimVars(FsContext ctx, int service_id, void* pData)
+bool HandleSimVars(FsContext ctx, const int service_id, void* pData)
 {
 	switch (service_id)
 	{
@@ -148,7 +148,7 @@ bool HandleSimVars(FsContext ctx, int service_id, void* pData)
  * =================== *
  */
 HANDLE hSimConnect;
-bool HandleSimConnect(FsContext ctx, int service_id, void* pData)
+bool HandleSimConnect(FsContext ctx, const int service_id, void* pData)
 {
 	switch (service_id)
 	{
@@ -203,7 +203,7 @@ struct FLIGHT_PATH_DATA
 	double vertical_fpa_rate; // degrees per second
 } flight_path_data;
 
-bool HandleFlightPathDataUpdate(FsContext ctx, int service_id, void* pData)
+bool HandleFlightPathDataUpdate(FsContext ctx, const int service_id, void* pData)
 {
 	switch (service_id)
 	{
@@ -266,7 +266,7 @@ bool InNormalLaw()
 	return in_normal_law;
 }
 const char * IN_NORMAL_LAW_VAR_NAME = "IN NORMAL LAW";
-bool HandleFlightControlLaws(FsContext ctx, int service_id, void* pData)
+bool HandleFlightControlLaws(FsContext ctx, const int service_id, void* pData)
 {
 	switch (service_id)
 	{
@@ -632,7 +632,7 @@ double FlightControlSystem_GetUserYokeXPosition()
 	return fabs(user_input.yoke_x) < null_zone_error ? 0 : user_input.yoke_x;
 }
 
-static PIDController roll_rate_controller(-1, 1, 1, 0, 0);
+static PIDController roll_rate_controller(-1, 1, 0.2, 0, 0);
 void FlightControlSystem_ManageRollControl(const double dt)
 {
 	// TODO: Handle other laws
@@ -648,6 +648,9 @@ void FlightControlSystem_ManageRollControl(const double dt)
 	{
 		// Apply overbank protections
 		commanded_roll_rate = 5 * -sign(flight_path_data.roll); // roll opposite at 5 degrees/second // TODO: tuning
+		const auto error = flight_path_data.roll_rate - commanded_roll_rate ;
+		control_surfaces.aileron = roll_rate_controller.Update(error, dt);
+		printf("OVERBANK: Roll = %lf, Commanding = %lf, Error = %lf, Aileron = %lf\n", flight_path_data.roll, commanded_roll_rate, error, control_surfaces.aileron);
 	}
 	// Check if we are approaching overbank
 	else if (fabs(flight_path_data.roll) > clamping_bank_angle && sign(flight_path_data.roll) == sign(commanded_roll_rate))
@@ -657,19 +660,29 @@ void FlightControlSystem_ManageRollControl(const double dt)
 		auto clamping_zone_position = fabs(flight_path_data.roll) - clamping_bank_angle;
 		auto effectiveness = 1 - (clamping_zone_position / clamping_zone_size);
 		commanded_roll_rate *= effectiveness;
+		const auto error = flight_path_data.roll_rate - commanded_roll_rate;
+		control_surfaces.aileron = roll_rate_controller.Update(error, dt);
+		printf("OVERBANK APPROACH: Roll = %lf, Effectiveness = %lf, Commanding = %lf, Error = %lf, Aileron = %lf\n", flight_path_data.roll, effectiveness, commanded_roll_rate, error, control_surfaces.aileron);
 	}
 	// Check if we are above nominal bank with no joystick input
 	else if (fabs(flight_path_data.roll) > nominal_bank_angle && commanded_roll_rate == 0)
 	{
 		// Roll back to the nominal bank angle
 		commanded_roll_rate = 5 * -sign(flight_path_data.roll); // roll opposite at 5 degrees/second // TODO: tuning
+		const auto error = flight_path_data.roll_rate - commanded_roll_rate;
+		control_surfaces.aileron = roll_rate_controller.Update(error, dt);
+		printf("ABOVE NOMINAL: Roll = %lf, Commanding = %lf, Error = %lf, Aileron = %lf\n", flight_path_data.roll, commanded_roll_rate, error, control_surfaces.aileron);
 	}
-	
-	// Get the user stick position
-	control_surfaces.aileron = roll_rate_controller.Update(commanded_roll_rate - flight_path_data.roll_rate, dt);
+	else
+	{
+		const auto error = flight_path_data.roll_rate - commanded_roll_rate;
+		control_surfaces.aileron = roll_rate_controller.Update(error, dt);
+		printf("NORMAL: Roll = %lf, Commanding = %lf, Error = %lf, Aileron = %lf\n", flight_path_data.roll, commanded_roll_rate, error, control_surfaces.aileron);
+		control_surfaces.aileron = roll_rate_controller.Update(commanded_roll_rate - flight_path_data.roll_rate, dt);
+	}	
 }
 
-bool HandleControlSurfaces(FsContext ctx, int service_id, void* pData)
+bool HandleControlSurfaces(FsContext ctx, const int service_id, void* pData)
 {
 	switch (service_id)
 	{

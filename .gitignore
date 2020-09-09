@@ -9,3 +9,4 @@
 !CODEOWNERS
 .DS_Store
 /src/sound/.cache
+!/WASM/**

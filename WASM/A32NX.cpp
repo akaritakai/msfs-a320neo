@@ -14,6 +14,11 @@ constexpr double sign(double value)
 {
 	return (value > 0) ? 1.0 : -1.0;
 }
+constexpr double clamp(double value, double min, double max)
+{
+	return (value < min) ? min : (value > max) ? max : value;
+}
+
 class PIDController
 {
 public:
@@ -25,40 +30,22 @@ public:
 	double Update(const double error, const double dt)
 	{
 		// Proportional term
-		double P = Kp * error;
+		auto P = Kp * error;
 
-		// Integral term
-		double I;
-		//if (sign(error) == sign(last_output) && (last_output <= output_min || last_output >= output_max))
-		//{
-			// Clamp integral
-		//	I = 0;
-		//}
-		//else
-		//{
-			integral += error * dt;
-			I = Ki * integral;
-		//}
+		// Integral term (trapezoidal area: assuming error moved linearly from last error to current error over dt)
+		integral += (last_error * dt) + (0.5 * dt * (error - last_error));
+		auto I = Ki * integral;
 
 		// Derivative term
-		double D = Kd * ((error - last_error) / dt);
+		auto D = Kd * ((error - last_error) / dt);
 
-		double output = P + I + D;
-		// Clamp output
-		if (output < output_min)
-		{
-			output = output_min;
-		}
-		else if (output > output_max)
-		{
-			output = output_max;
-		}
+		auto output = P + I + D;
+		output = clamp(output, output_min, output_max);
 
 		// Save terms
 		last_output = output;
 		last_error = error;
 
-		printf("Error: %lf, Integral: %lf\n", error, integral);
 		return output;
 	}
 	void Reset()
@@ -84,18 +71,25 @@ struct SIM_VARS
 	// Units
 	ENUM bool_units; // Bool
 	ENUM degrees_units; // Degrees
+	ENUM degrees_per_second_units; // Degrees per second
 	ENUM feet_units; // Feet
+	ENUM feet_per_second_units; // Feet per second
 	ENUM gforce_units; // GForce
+	ENUM knots_units; // Knots
 	ENUM percent_units; // Percent
 	ENUM radians_units; // Radians
 	// Variables
+	ENUM airspeed_true; // AIRSPEED TRUE
 	ENUM elevator_deflection; // ELEVATOR DEFLECTION
 	ENUM elevator_deflection_pct; // ELEVATOR DEFLECTION PCT
 	ENUM gforce; // G FORCE
 	ENUM plane_bank_degrees; // PLANE BANK DEGREES
 	ENUM plane_pitch_degrees; // PLANE PITCH DEGREES
 	ENUM radio_height; // RADIO HEIGHT
+	ENUM rotation_velocity_body_x; // ROTATION VELOCITY BODY X
+	ENUM rotation_velocity_body_y; // ROTATION VELOCITY BODY Y
 	ENUM sim_on_ground; // SIM ON GROUND
+	ENUM vertical_speed; // VERTICAL SPEED
 } sim_vars;
 
 bool HandleSimVars(FsContext ctx, int service_id, void* pData)
@@ -107,18 +101,25 @@ bool HandleSimVars(FsContext ctx, int service_id, void* pData)
 		// Units
 		sim_vars.bool_units = get_units_enum("Bool");
 		sim_vars.degrees_units = get_units_enum("Degrees");
+		sim_vars.degrees_per_second_units = get_units_enum("Degrees per second");
 		sim_vars.feet_units = get_units_enum("Feet");
+		sim_vars.feet_per_second_units = get_units_enum("Feet per second");
 		sim_vars.gforce_units = get_units_enum("GForce");
+		sim_vars.knots_units = get_units_enum("Knots");
 		sim_vars.percent_units = get_units_enum("Percent");
 		sim_vars.radians_units = get_units_enum("Radians");
 		// Variables
+		sim_vars.airspeed_true = get_aircraft_var_enum("AIRSPEED TRUE");
 		sim_vars.elevator_deflection = get_aircraft_var_enum("ELEVATOR DEFLECTION");
 		sim_vars.elevator_deflection_pct = get_aircraft_var_enum("ELEVATOR DEFLECTION PCT");
 		sim_vars.gforce = get_aircraft_var_enum("G FORCE");
 		sim_vars.plane_bank_degrees = get_aircraft_var_enum("PLANE BANK DEGREES");
 		sim_vars.plane_pitch_degrees = get_aircraft_var_enum("PLANE PITCH DEGREES");
 		sim_vars.radio_height = get_aircraft_var_enum("RADIO HEIGHT");
+		sim_vars.rotation_velocity_body_x = get_aircraft_var_enum("ROTATION VELOCITY BODY X");
+		sim_vars.rotation_velocity_body_y = get_aircraft_var_enum("ROTATION VELOCITY BODY Y");
 		sim_vars.sim_on_ground = get_aircraft_var_enum("SIM ON GROUND");
+		sim_vars.vertical_speed = get_aircraft_var_enum("VERTICAL SPEED");
 		return true;
 	}
 	break;
@@ -187,6 +188,71 @@ bool HandleSimConnect(FsContext ctx, int service_id, void* pData)
 	return false;
 }
 
+/*
+ * ===================== *
+ * Flight Path Variables *
+ * ===================== *
+ */
+struct FLIGHT_PATH_DATA
+{
+	double pitch; // degrees
+	double pitch_rate; // degrees per second
+	double roll; // degrees
+	double roll_rate; // degrees per second
+	double vertical_fpa; // degrees
+	double vertical_fpa_rate; // degrees per second
+} flight_path_data;
+
+bool HandleFlightPathDataUpdate(FsContext ctx, int service_id, void* pData)
+{
+	switch (service_id)
+	{
+	case PANEL_SERVICE_PRE_INSTALL:
+	{
+		return true;
+	}
+	break;
+	case PANEL_SERVICE_POST_INSTALL:
+	{
+		return true;
+	}
+	break;
+	case PANEL_SERVICE_PRE_DRAW:
+	{
+		// Sent before the gauge is drawn. The pData parameter points to a sGaugeDrawData structure:
+		// - The dt member gives the time elapsed since last frame.
+		auto* p_draw_data = static_cast<sGaugeDrawData*>(pData);
+		auto dt = p_draw_data->dt;
+
+		// Update pitch info
+		flight_path_data.pitch = aircraft_varget(sim_vars.plane_pitch_degrees, sim_vars.degrees_units, 0);
+		flight_path_data.pitch_rate = aircraft_varget(sim_vars.rotation_velocity_body_y, sim_vars.degrees_per_second_units, 0);
+
+		// Update roll info
+		flight_path_data.roll = aircraft_varget(sim_vars.plane_bank_degrees, sim_vars.degrees_units, 0);
+		flight_path_data.roll_rate = aircraft_varget(sim_vars.rotation_velocity_body_x, sim_vars.degrees_per_second_units, 0);
+
+		// Update vertical fpa info
+		auto last_vertical_fpa = flight_path_data.vertical_fpa;
+		// Vertical FPA = arctan(vertical speed / true airspeed)
+		auto vertical_speed = aircraft_varget(sim_vars.vertical_speed, sim_vars.feet_per_second_units, 0);
+		auto true_airspeed = aircraft_varget(sim_vars.airspeed_true, sim_vars.knots_units, 0);
+		const auto knots_to_feet_per_minute_ratio = (60.0 / 1.0) * (1.0 / 6076.0); // (60 min / 1 h) * (1 nm / 6076 ft)
+		flight_path_data.vertical_fpa = atan(vertical_speed * (1 / true_airspeed) * knots_to_feet_per_minute_ratio) * (180 / M_PI);
+		flight_path_data.vertical_fpa_rate = (flight_path_data.vertical_fpa - last_vertical_fpa) / dt;
+
+		return true;
+	}
+	break;
+	case PANEL_SERVICE_PRE_KILL:
+	{
+		return true;
+	}
+	break;
+	default: break;
+	}
+	return false;
+}
 
 /*
  * =================== *
@@ -243,10 +309,19 @@ enum PITCH_CONTROL_MODE
 	FLARE_MODE
 };
 PITCH_CONTROL_MODE pitch_control_mode = GROUND_MODE;
+double pitch_control_mode_ground_effect = 1.0;
+double pitch_control_mode_flight_effect = 0.0;
+double pitch_control_mode_flare_effect = 0.0;
 const char* PITCH_CONTROL_MODE_VAR_NAME = "PITCH CONTROL MODE";
 
+void PitchControlMode_BlendEffect(double * blend_in, double * blend_out, const double increment)
+{
+	*blend_in = clamp(*blend_in + increment, 0, 1);
+	*blend_out = clamp(*blend_out - increment, 0, 1);
+}
+
 double ground_to_flight_condition_start_time = 0;
-void PitchControlMode_HandleGroundTransitions(double current_sim_time)
+void PitchControlMode_HandleGroundTransitions(const double dt)
 {
 	if (pitch_control_mode == GROUND_MODE)
 	{
@@ -258,29 +333,26 @@ void PitchControlMode_HandleGroundTransitions(double current_sim_time)
 			auto pitch_attitude = aircraft_varget(sim_vars.plane_pitch_degrees, sim_vars.degrees_units, 0);
 			if ((radio_altimeter > 50) || (in_flight && (pitch_attitude > 8)))
 			{
-				if (ground_to_flight_condition_start_time == 0)
+				// Blend in flight effect and blend out ground effect
+				PitchControlMode_BlendEffect(&pitch_control_mode_flight_effect, &pitch_control_mode_ground_effect, dt / 5);
+				if (pitch_control_mode_flight_effect == 1)
 				{
-					ground_to_flight_condition_start_time = current_sim_time;
+					pitch_control_mode = FLIGHT_MODE;
+					pitch_control_mode_ground_effect = 0;
+					pitch_control_mode_flare_effect = 0;
 				}
-				else
-				{
-					if (current_sim_time - ground_to_flight_condition_start_time >= 5)
-					{
-						printf("A32NX: Ground Mode -> Flight Mode\n");
-						pitch_control_mode = FLIGHT_MODE;
-						ground_to_flight_condition_start_time = 0;
-					}
-				}
-				return;
 			}
-			ground_to_flight_condition_start_time = 0;
+			else
+			{
+				// Blend in ground effect and blend out flight effect
+				PitchControlMode_BlendEffect(&pitch_control_mode_ground_effect, &pitch_control_mode_flight_effect, dt / 5);
+			}
 		}
 		// TODO: Handle other laws
 	}
 }
 
-double flight_to_flare_condition_start_time = 0;
-void PitchControlMode_HandleFlightTransitions(double current_sim_time)
+void PitchControlMode_HandleFlightTransitions(const double dt)
 {
 	if (pitch_control_mode == FLIGHT_MODE)
 	{
@@ -290,82 +362,76 @@ void PitchControlMode_HandleFlightTransitions(double current_sim_time)
 			auto radio_altimeter = aircraft_varget(sim_vars.radio_height, sim_vars.feet_units, 0);
 			if (radio_altimeter < 50)
 			{
-				if (flight_to_flare_condition_start_time == 0)
+				// Blend in flare effect and blend out flight effect
+				PitchControlMode_BlendEffect(&pitch_control_mode_flare_effect, &pitch_control_mode_flight_effect, dt / 1);
+				if (pitch_control_mode_flare_effect == 1)
 				{
-					flight_to_flare_condition_start_time = current_sim_time;
+					pitch_control_mode = FLARE_MODE;
+					pitch_control_mode_ground_effect = 0;
+					pitch_control_mode_flight_effect = 0;
 				}
-				else
-				{
-					if (current_sim_time - flight_to_flare_condition_start_time >= 1)
-					{
-						printf("A32NX: Flight Mode -> Flare Mode\n");
-						pitch_control_mode = FLARE_MODE;
-						flight_to_flare_condition_start_time = 0;
-					}
-				}
-				return;
 			}
-			flight_to_flare_condition_start_time = 0;
+			else
+			{
+				// Blend in flight effect and blend out flare effect
+				PitchControlMode_BlendEffect(&pitch_control_mode_flight_effect, &pitch_control_mode_flare_effect, dt / 1);
+			}
 		}
 		// TODO: Handle other laws
 	}
 }
 
-double flare_to_flight_condition_start_time = 0;
-double flare_to_ground_condition_start_time = 0;
-void PitchControlMode_HandleFlareTransitions(double current_sim_time)
+void PitchControlMode_HandleFlareTransitions(const double dt)
 {
 	if (pitch_control_mode == FLARE_MODE)
 	{
 		if (InNormalLaw())
 		{
-			// Handle flare to flight transition
 			auto radio_altimeter = aircraft_varget(sim_vars.radio_height, sim_vars.feet_units, 0);
-			if (radio_altimeter > 50)
-			{
-				if (flare_to_flight_condition_start_time == 0)
-				{
-					flare_to_flight_condition_start_time = current_sim_time;
-				}
-				else
-				{
-					if (current_sim_time - flare_to_flight_condition_start_time >= 1)
-					{
-						printf("A32NX: Flare Mode -> Flight Mode\n");
-						pitch_control_mode = FLIGHT_MODE;
-						flare_to_flight_condition_start_time = 0;
-					}
-				}
-				return;
-			}
-			flare_to_flight_condition_start_time = 0;
-			// Handle flare to ground transition
 			auto on_ground = aircraft_varget(sim_vars.sim_on_ground, sim_vars.bool_units, 0) != 0;
 			auto pitch_attitude = aircraft_varget(sim_vars.plane_pitch_degrees, sim_vars.degrees_units, 0);
-			if (on_ground && (pitch_attitude < 2.5))
+			// Handle flare to flight transition
+			if (radio_altimeter > 50)
 			{
-				if (flare_to_ground_condition_start_time == 0)
+				// Blend in flight effect and blend out flare effect
+				PitchControlMode_BlendEffect(&pitch_control_mode_flight_effect, &pitch_control_mode_flare_effect, dt / 1);
+				if (pitch_control_mode_flight_effect == 1)
 				{
-					flare_to_ground_condition_start_time = current_sim_time;
+					pitch_control_mode = FLIGHT_MODE;
+					pitch_control_mode_ground_effect = 0;
+					pitch_control_mode_flare_effect = 0;
 				}
-				else
-				{
-					if (current_sim_time - flare_to_ground_condition_start_time >= 5)
-					{
-						printf("A32NX: Flare Mode -> Ground Mode\n");
-						pitch_control_mode = GROUND_MODE;
-						flare_to_ground_condition_start_time = 0;
-					}
-				}
-				return;
 			}
-			flare_to_ground_condition_start_time = 0;
+			// Handle flare to ground transition
+			else if (on_ground && (pitch_attitude < 2.5))
+			{
+				// Blend in ground effect and blend out flare effect
+				PitchControlMode_BlendEffect(&pitch_control_mode_ground_effect, &pitch_control_mode_flare_effect, dt / 5);
+				if (pitch_control_mode_ground_effect == 1)
+				{
+					pitch_control_mode = GROUND_MODE;
+					pitch_control_mode_flight_effect = 0;
+					pitch_control_mode_flare_effect = 0;
+				}
+			}
+			else
+			{
+				// Blend in flare effect and blend out flight and ground effects
+				if (pitch_control_mode_ground_effect > 0)
+				{
+					PitchControlMode_BlendEffect(&pitch_control_mode_flare_effect, &pitch_control_mode_ground_effect, dt / 5);
+				}
+				if (pitch_control_mode_flight_effect > 0)
+				{
+					PitchControlMode_BlendEffect(&pitch_control_mode_flare_effect, &pitch_control_mode_flight_effect, dt / 1);
+				}
+			}
 		}
 		// TODO: Handle other laws
 	}
 }
 
-bool HandlePitchControlMode(FsContext ctx, int service_id, void* pData)
+bool HandlePitchControlMode(FsContext ctx, const int service_id, void* pData)
 {
 	switch (service_id)
 	{
@@ -383,20 +449,19 @@ bool HandlePitchControlMode(FsContext ctx, int service_id, void* pData)
 	case PANEL_SERVICE_PRE_DRAW:
 	{	
 		// Sent before the gauge is drawn. The pData parameter points to a sGaugeDrawData structure:
-		// - The t member gives the absolute simulation time.
 		// - The dt member gives the time elapsed since last frame.
 		auto* p_draw_data = static_cast<sGaugeDrawData*>(pData);
-		auto current_sim_time = p_draw_data->t;
+		const auto dt = p_draw_data->dt;
 		switch (pitch_control_mode)
 		{
 		case GROUND_MODE:
-			PitchControlMode_HandleGroundTransitions(current_sim_time);
+			PitchControlMode_HandleGroundTransitions(dt);
 			break;
 		case FLIGHT_MODE:
-			PitchControlMode_HandleFlightTransitions(current_sim_time);
+			PitchControlMode_HandleFlightTransitions(dt);
 			break;
 		case FLARE_MODE:
-			PitchControlMode_HandleFlareTransitions(current_sim_time);
+			PitchControlMode_HandleFlareTransitions(dt);
 			break;
 		}
 		return true;
@@ -478,7 +543,7 @@ void CALLBACK OnInputCaptureEvent(SIMCONNECT_RECV* pData, DWORD cbData, void* pC
 	}
 }
 
-bool HandleInputCapture(FsContext ctx, int service_id, void* pData)
+bool HandleInputCapture(FsContext ctx, const int service_id, void* pData)
 {
 	switch (service_id)
 	{
@@ -519,7 +584,6 @@ bool HandleInputCapture(FsContext ctx, int service_id, void* pData)
 	case PANEL_SERVICE_PRE_DRAW:
 	{
 		SimConnect_CallDispatch(hSimConnect, OnInputCaptureEvent, nullptr);
-		printf("X: %lf, Y: %lf, Z: %lf\n", user_input.yoke_x, user_input.yoke_y, user_input.rudder);
 		return true;
 	}
 	break;
@@ -552,55 +616,57 @@ struct CONTROL_SURFACES_DATA
 enum DEFINITION_ID
 {
 	CONTROL_SURFACES_DEFINITION,
-	//CONTROL_SURFACES_ANIMATION_DEFINITION
 };
 
-double FlightControlSystem_InferUserLoadFactorIntent()
+double FlightControlSystem_GetUserYokeYPosition()
 {
 	// Get the user stick position with a null zone
 	auto null_zone_error = 0.05 * 2; // 5% of the stick movement is null (2 units of total travel distance over [-1,1])
-	double normalized_user_input = abs(user_input.yoke_y) < null_zone_error ? 0 : user_input.yoke_y;
-
-	// Determine the normal load factor at our bank angle
-	auto roll_angle = aircraft_varget(sim_vars.plane_bank_degrees, sim_vars.radians_units, 0);
-	auto normal_load_factor = 1/cos(roll_angle);
-
-	// Determine the user's load factor
-	auto requested_load_factor = 2 * normalized_user_input + normal_load_factor; // Linear relationship between request and actual value
-
-	// Clamp the load factor to within limits (-1G to +2.5G)
-	double final_load_factor;
-	if (requested_load_factor < -1)
-	{
-		final_load_factor = -1;
-	}
-	else if (requested_load_factor > 2.5)
-	{
-		final_load_factor = 2.5;
-	}
-	else
-	{
-		final_load_factor = requested_load_factor;
-	}
-	
-	printf("Input: %lf, Normal input: %lf, Roll: %lf, Normal LF: %lf, Requested LF: %lf, Final LF: %lf\n", user_input.yoke_y, normalized_user_input, roll_angle, normal_load_factor, requested_load_factor, final_load_factor);
-	return final_load_factor;
+	return fabs(user_input.yoke_y) < null_zone_error ? 0 : user_input.yoke_y;
 }
 
-static PIDController pitch_controller(-1, 1, 0.5, 0.1, 0.1);
-void FlightControlSystem_ManagePitchControl(double dt)
+double FlightControlSystem_GetUserYokeXPosition()
 {
-	if (pitch_control_mode == FLIGHT_MODE)
+	// Get the user stick position with a null zone
+	auto null_zone_error = 0.05 * 2; // 5% of the stick movement is null (2 units of total travel distance over [-1,1])
+	return fabs(user_input.yoke_x) < null_zone_error ? 0 : user_input.yoke_x;
+}
+
+static PIDController roll_rate_controller(-1, 1, 1, 0, 0);
+void FlightControlSystem_ManageRollControl(const double dt)
+{
+	// TODO: Handle other laws
+	
+	const auto maximum_bank_angle = 67; // Maximum bank angle // TODO: Change this when other kinds of protections are active
+	const auto clamping_bank_angle = maximum_bank_angle - 5; // Bank angle at which to clamp roll response // TODO: Tuning?
+	const auto nominal_bank_angle = 33; // Maximum bank angle allowed for turns // TODO: Change this when other kinds of protections are active
+
+	// Determine the user's commanded roll rate
+	auto commanded_roll_rate = 15 * FlightControlSystem_GetUserYokeXPosition(); // degrees per second
+	// Check if we are overbanked
+	if (fabs(flight_path_data.roll) > maximum_bank_angle)
 	{
-		auto current_load_factor = aircraft_varget(sim_vars.gforce, sim_vars.gforce_units, 0);
-		auto requested_load_factor = FlightControlSystem_InferUserLoadFactorIntent();
-		control_surfaces.elevator = pitch_controller.Update(requested_load_factor - current_load_factor, dt);
-		printf("Current LF: %lf, Requested LF: %lf, Error LF: %lf, Elevator Position: %lf\n", current_load_factor, requested_load_factor, requested_load_factor - current_load_factor, control_surfaces.elevator);
-	} else
-	{
-		pitch_controller.Reset();
-		control_surfaces.elevator = user_input.yoke_y;
+		// Apply overbank protections
+		commanded_roll_rate = 5 * -sign(flight_path_data.roll); // roll opposite at 5 degrees/second // TODO: tuning
 	}
+	// Check if we are approaching overbank
+	else if (fabs(flight_path_data.roll) > clamping_bank_angle && sign(flight_path_data.roll) == sign(commanded_roll_rate))
+	{
+		// Linearly reduce our roll rate authority as we approach the maximum bank angle
+		auto clamping_zone_size = maximum_bank_angle - clamping_bank_angle;
+		auto clamping_zone_position = fabs(flight_path_data.roll) - clamping_bank_angle;
+		auto effectiveness = 1 - (clamping_zone_position / clamping_zone_size);
+		commanded_roll_rate *= effectiveness;
+	}
+	// Check if we are above nominal bank with no joystick input
+	else if (fabs(flight_path_data.roll) > nominal_bank_angle && commanded_roll_rate == 0)
+	{
+		// Roll back to the nominal bank angle
+		commanded_roll_rate = 5 * -sign(flight_path_data.roll); // roll opposite at 5 degrees/second // TODO: tuning
+	}
+	
+	// Get the user stick position
+	control_surfaces.aileron = roll_rate_controller.Update(commanded_roll_rate - flight_path_data.roll_rate, dt);
 }
 
 bool HandleControlSurfaces(FsContext ctx, int service_id, void* pData)
@@ -627,11 +693,10 @@ bool HandleControlSurfaces(FsContext ctx, int service_id, void* pData)
         // - The dt member gives the time elapsed since last frame.
 		auto* p_draw_data = static_cast<sGaugeDrawData*>(pData);
 		auto dt = p_draw_data->dt;
-		FlightControlSystem_ManagePitchControl(dt);
-		control_surfaces.aileron = user_input.yoke_x;
+		control_surfaces.elevator = user_input.yoke_y;
+		FlightControlSystem_ManageRollControl(dt);
 		control_surfaces.rudder = user_input.rudder;
 		SimConnect_SetDataOnSimObject(hSimConnect, CONTROL_SURFACES_DEFINITION, SIMCONNECT_OBJECT_ID_USER, 0, 0, sizeof(control_surfaces), &control_surfaces);
-		printf("Elevator deflection: %lf, Elevator Deflection Pct: %lf\n", aircraft_varget(sim_vars.elevator_deflection, sim_vars.degrees_units, 0), aircraft_varget(sim_vars.elevator_deflection_pct, sim_vars.percent_units, 0));
 		return true;
 	}
 	break;
@@ -656,11 +721,12 @@ extern "C"
 	/*
 	 * Handles all system states
 	 */
-	MSFS_CALLBACK bool A32NX_gauge_callback(FsContext ctx, int service_id, void* pData)
+	MSFS_CALLBACK bool A32NX_gauge_callback(FsContext ctx, const int service_id, void* pData)
 	{
 		auto ret = true;
 		ret &= HandleSimVars(ctx, service_id, pData);
 		ret &= HandleSimConnect(ctx, service_id, pData);
+		ret &= HandleFlightPathDataUpdate(ctx, service_id, pData);
 		ret &= HandleFlightControlLaws(ctx, service_id, pData);
 		ret &= HandlePitchControlMode(ctx, service_id, pData);
 		ret &= HandleInputCapture(ctx, service_id, pData);

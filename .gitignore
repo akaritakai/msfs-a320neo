@@ -1,7 +1,12 @@
 *
 !*/
+!/.vscode/**
+!/.github/**
 !/A32NX/**
-!/WASM/**
+!/docs/**
+!/src/**
 !.gitignore
-!/WASM/**
+!CODEOWNERS
 .DS_Store
+/src/sound/.cache
+!/WASM/**

@@ -27,6 +27,14 @@ public:
 		  Kp(Kp), Kd(Kd), Ki(Ki),
 		  integral(0),
 		  last_error(0), last_output(0)  {};
+	void Modify(const double new_output_min, const double new_output_max, const double new_Kp, const double new_Ki, const double new_Kd)
+	{
+		output_min = new_output_min;
+		output_max = new_output_max;
+		Kp = new_Kp;
+		Ki = new_Ki;
+		Kd = new_Kd;
+	}
 	double Update(const double error, const double dt)
 	{
 		// Proportional term
@@ -197,7 +205,7 @@ struct FLIGHT_PATH_DATA
 {
 	double pitch; // degrees
 	double pitch_rate; // degrees per second
-	double roll; // degrees
+	double roll; // degrees (rolled right == positive numbers, rolled left == negative numbers)
 	double roll_rate; // degrees per second
 	double vertical_fpa; // degrees
 	double vertical_fpa_rate; // degrees per second
@@ -229,8 +237,10 @@ bool HandleFlightPathDataUpdate(FsContext ctx, const int service_id, void* pData
 		flight_path_data.pitch_rate = aircraft_varget(sim_vars.rotation_velocity_body_y, sim_vars.degrees_per_second_units, 0);
 
 		// Update roll info
-		flight_path_data.roll = aircraft_varget(sim_vars.plane_bank_degrees, sim_vars.degrees_units, 0);
-		flight_path_data.roll_rate = aircraft_varget(sim_vars.rotation_velocity_body_x, sim_vars.degrees_per_second_units, 0);
+		double last_roll = flight_path_data.roll;
+		flight_path_data.roll = -aircraft_varget(sim_vars.plane_bank_degrees, sim_vars.degrees_units, 0);
+		//flight_path_data.roll_rate = -aircraft_varget(sim_vars.rotation_velocity_body_x, sim_vars.degrees_per_second_units, 0);
+		flight_path_data.roll_rate = (flight_path_data.roll - last_roll) / dt;
 
 		// Update vertical fpa info
 		auto last_vertical_fpa = flight_path_data.vertical_fpa;
@@ -632,54 +642,50 @@ double FlightControlSystem_GetUserYokeXPosition()
 	return fabs(user_input.yoke_x) < null_zone_error ? 0 : user_input.yoke_x;
 }
 
-static PIDController roll_rate_controller(-1, 1, 0.2, 0, 0);
+static PIDController roll_rate_controller(-1, 1, 0, 0, 0);
 void FlightControlSystem_ManageRollControl(const double dt)
 {
 	// TODO: Handle other laws
 	
 	const auto maximum_bank_angle = 67; // Maximum bank angle // TODO: Change this when other kinds of protections are active
-	const auto clamping_bank_angle = maximum_bank_angle - 5; // Bank angle at which to clamp roll response // TODO: Tuning?
+	const auto clamping_bank_angle = maximum_bank_angle - 10; // Bank angle at which to clamp roll response // TODO: Tuning?
 	const auto nominal_bank_angle = 33; // Maximum bank angle allowed for turns // TODO: Change this when other kinds of protections are active
 
-	// Determine the user's commanded roll rate
 	auto commanded_roll_rate = 15 * FlightControlSystem_GetUserYokeXPosition(); // degrees per second
-	// Check if we are overbanked
-	if (fabs(flight_path_data.roll) > maximum_bank_angle)
-	{
-		// Apply overbank protections
-		commanded_roll_rate = 5 * -sign(flight_path_data.roll); // roll opposite at 5 degrees/second // TODO: tuning
-		const auto error = flight_path_data.roll_rate - commanded_roll_rate ;
-		control_surfaces.aileron = roll_rate_controller.Update(error, dt);
-		printf("OVERBANK: Roll = %lf, Commanding = %lf, Error = %lf, Aileron = %lf\n", flight_path_data.roll, commanded_roll_rate, error, control_surfaces.aileron);
-	}
-	// Check if we are approaching overbank
-	else if (fabs(flight_path_data.roll) > clamping_bank_angle && sign(flight_path_data.roll) == sign(commanded_roll_rate))
-	{
-		// Linearly reduce our roll rate authority as we approach the maximum bank angle
-		auto clamping_zone_size = maximum_bank_angle - clamping_bank_angle;
-		auto clamping_zone_position = fabs(flight_path_data.roll) - clamping_bank_angle;
-		auto effectiveness = 1 - (clamping_zone_position / clamping_zone_size);
-		commanded_roll_rate *= effectiveness;
-		const auto error = flight_path_data.roll_rate - commanded_roll_rate;
-		control_surfaces.aileron = roll_rate_controller.Update(error, dt);
-		printf("OVERBANK APPROACH: Roll = %lf, Effectiveness = %lf, Commanding = %lf, Error = %lf, Aileron = %lf\n", flight_path_data.roll, effectiveness, commanded_roll_rate, error, control_surfaces.aileron);
-	}
-	// Check if we are above nominal bank with no joystick input
-	else if (fabs(flight_path_data.roll) > nominal_bank_angle && commanded_roll_rate == 0)
-	{
-		// Roll back to the nominal bank angle
-		commanded_roll_rate = 5 * -sign(flight_path_data.roll); // roll opposite at 5 degrees/second // TODO: tuning
-		const auto error = flight_path_data.roll_rate - commanded_roll_rate;
-		control_surfaces.aileron = roll_rate_controller.Update(error, dt);
-		printf("ABOVE NOMINAL: Roll = %lf, Commanding = %lf, Error = %lf, Aileron = %lf\n", flight_path_data.roll, commanded_roll_rate, error, control_surfaces.aileron);
+	
+	if (commanded_roll_rate == 0)
+	{		
+		// We should be holding the specified angle
+		roll_rate_controller.Modify(-0.25, 0.25, 0.32, 0.32, 0);
+
+		// If we are banked beyond the nominal bank angle, roll back to the nominal bank angle
+		if (fabs(flight_path_data.roll) > nominal_bank_angle)
+		{
+			commanded_roll_rate = 5 * -sign(flight_path_data.roll); // roll opposite at 5 degrees per second // TODO: Tuning?
+		}
 	}
 	else
 	{
-		const auto error = flight_path_data.roll_rate - commanded_roll_rate;
-		control_surfaces.aileron = roll_rate_controller.Update(error, dt);
-		printf("NORMAL: Roll = %lf, Commanding = %lf, Error = %lf, Aileron = %lf\n", flight_path_data.roll, commanded_roll_rate, error, control_surfaces.aileron);
-		control_surfaces.aileron = roll_rate_controller.Update(commanded_roll_rate - flight_path_data.roll_rate, dt);
-	}	
+		// We should be responsive to the user's roll request
+		roll_rate_controller.Modify(-1, 1, 0.64, 0, 0);
+		
+		// Check if we are overbanked
+		if (fabs(flight_path_data.roll) > maximum_bank_angle)
+		{
+			// Apply overbank protections
+			commanded_roll_rate = 5 * -sign(flight_path_data.roll); // roll opposite at 5 degrees per second // TODO: Tuning?
+		}
+		// Check if we are approaching overbank
+		else if (fabs(flight_path_data.roll) > clamping_bank_angle && sign(flight_path_data.roll) == sign(commanded_roll_rate))
+		{
+			// Linearly reduce our roll rate authority as we approach the maximum bank angle
+			auto clamping_zone_size = maximum_bank_angle - clamping_bank_angle;
+			auto clamping_zone_position = fabs(flight_path_data.roll) - clamping_bank_angle;
+			auto effectiveness = 1 - (clamping_zone_position / clamping_zone_size);
+			commanded_roll_rate *= effectiveness;
+		}
+	}
+	roll_rate_controller.Update(commanded_roll_rate - flight_path_data.roll_rate, dt);
 }
 
 bool HandleControlSurfaces(FsContext ctx, const int service_id, void* pData)

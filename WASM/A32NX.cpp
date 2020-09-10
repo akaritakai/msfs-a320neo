@@ -18,6 +18,10 @@ constexpr double clamp(double value, double min, double max)
 {
 	return (value < min) ? min : (value > max) ? max : value;
 }
+constexpr double radians(double value)
+{
+	return value * (M_PI / 180);
+}
 
 class PIDController
 {
@@ -41,7 +45,11 @@ public:
 		auto P = Kp * error;
 
 		// Integral term (trapezoidal area: assuming error moved linearly from last error to current error over dt)
-		integral += (last_error * dt) + (0.5 * dt * (error - last_error));
+		if (Ki != 0)
+		{
+			integral += (last_error * dt) + (0.5 * dt * (error - last_error));
+			
+		}
 		auto I = Ki * integral;
 
 		// Derivative term
@@ -203,12 +211,16 @@ bool HandleSimConnect(FsContext ctx, const int service_id, void* pData)
  */
 struct FLIGHT_PATH_DATA
 {
+	double gforce; // gforce
+	double gforce_rate; // gforce rate
 	double pitch; // degrees
 	double pitch_rate; // degrees per second
 	double roll; // degrees (rolled right == positive numbers, rolled left == negative numbers)
 	double roll_rate; // degrees per second
 	double vertical_fpa; // degrees
 	double vertical_fpa_rate; // degrees per second
+	double vertical_speed; // feet per second
+	double vertical_speed_rate; // feet per second per second
 } flight_path_data;
 
 bool HandleFlightPathDataUpdate(FsContext ctx, const int service_id, void* pData)
@@ -232,6 +244,11 @@ bool HandleFlightPathDataUpdate(FsContext ctx, const int service_id, void* pData
 		auto* p_draw_data = static_cast<sGaugeDrawData*>(pData);
 		auto dt = p_draw_data->dt;
 
+		// Update gforce info
+		auto last_gforce = flight_path_data.gforce;
+		flight_path_data.gforce = aircraft_varget(sim_vars.gforce, sim_vars.gforce_units, 0);
+		flight_path_data.gforce_rate = (flight_path_data.gforce - last_gforce) / dt;
+			
 		// Update pitch info
 		flight_path_data.pitch = aircraft_varget(sim_vars.plane_pitch_degrees, sim_vars.degrees_units, 0);
 		flight_path_data.pitch_rate = aircraft_varget(sim_vars.rotation_velocity_body_y, sim_vars.degrees_per_second_units, 0);
@@ -239,17 +256,21 @@ bool HandleFlightPathDataUpdate(FsContext ctx, const int service_id, void* pData
 		// Update roll info
 		double last_roll = flight_path_data.roll;
 		flight_path_data.roll = -aircraft_varget(sim_vars.plane_bank_degrees, sim_vars.degrees_units, 0);
-		//flight_path_data.roll_rate = -aircraft_varget(sim_vars.rotation_velocity_body_x, sim_vars.degrees_per_second_units, 0);
 		flight_path_data.roll_rate = (flight_path_data.roll - last_roll) / dt;
 
 		// Update vertical fpa info
-		auto last_vertical_fpa = flight_path_data.vertical_fpa;
+		const auto last_vertical_fpa = flight_path_data.vertical_fpa;
 		// Vertical FPA = arctan(vertical speed / true airspeed)
-		auto vertical_speed = aircraft_varget(sim_vars.vertical_speed, sim_vars.feet_per_second_units, 0);
-		auto true_airspeed = aircraft_varget(sim_vars.airspeed_true, sim_vars.knots_units, 0);
+		const auto vertical_speed = aircraft_varget(sim_vars.vertical_speed, sim_vars.feet_per_second_units, 0);
+		const auto true_airspeed = aircraft_varget(sim_vars.airspeed_true, sim_vars.knots_units, 0);
 		const auto knots_to_feet_per_minute_ratio = (60.0 / 1.0) * (1.0 / 6076.0); // (60 min / 1 h) * (1 nm / 6076 ft)
 		flight_path_data.vertical_fpa = atan(vertical_speed * (1 / true_airspeed) * knots_to_feet_per_minute_ratio) * (180 / M_PI);
 		flight_path_data.vertical_fpa_rate = (flight_path_data.vertical_fpa - last_vertical_fpa) / dt;
+
+		// Update vertical speed info
+		const auto last_vertical_speed = flight_path_data.vertical_speed;
+		flight_path_data.vertical_speed = aircraft_varget(sim_vars.vertical_speed, sim_vars.feet_per_second_units, 0);
+		flight_path_data.vertical_speed_rate = (flight_path_data.vertical_speed - last_vertical_speed) / dt;
 
 		return true;
 	}
@@ -625,7 +646,7 @@ struct CONTROL_SURFACES_DATA
 
 enum DEFINITION_ID
 {
-	CONTROL_SURFACES_DEFINITION,
+	CONTROL_SURFACES_DEFINITION
 };
 
 double FlightControlSystem_GetUserYokeYPosition()
@@ -640,6 +661,30 @@ double FlightControlSystem_GetUserYokeXPosition()
 	// Get the user stick position with a null zone
 	auto null_zone_error = 0.05 * 2; // 5% of the stick movement is null (2 units of total travel distance over [-1,1])
 	return fabs(user_input.yoke_x) < null_zone_error ? 0 : user_input.yoke_x;
+}
+
+static PIDController gforce_rate_controller(-1, 1, 0.64, 0.32, 0.005);
+void FlightControlSystem_ManagePitchControl(const double dt)
+{
+	if (FlightControlSystem_GetUserYokeYPosition() == 0)
+	{
+		gforce_rate_controller.Modify(-1, 1, 0.32, 0.16, 0);
+	}
+	else
+	{
+		gforce_rate_controller.Modify(-1, 1, 0.64, 0, 0.32);
+	}
+	
+	auto normal_load_factor = 1 / cos(radians(flight_path_data.roll));
+
+	// Determine the user's load factor
+	auto requested_load_factor = 2 * FlightControlSystem_GetUserYokeYPosition() + normal_load_factor; // Linear relationship between request and actual value
+	requested_load_factor = clamp(requested_load_factor, -1, 2.5);
+
+	auto current_load_factor = flight_path_data.gforce;
+	auto error = requested_load_factor - current_load_factor;
+	control_surfaces.elevator = gforce_rate_controller.Update(error, dt);
+	printf("GFORCE: CurrLF = %lf, NormLF = %lf, ReqLF = %lf, Error = %lf, Elevator = %lf\n", current_load_factor, normal_load_factor, requested_load_factor, error, control_surfaces.elevator);
 }
 
 static PIDController roll_rate_controller(-1, 1, 0, 0, 0);
@@ -679,13 +724,13 @@ void FlightControlSystem_ManageRollControl(const double dt)
 		else if (fabs(flight_path_data.roll) > clamping_bank_angle && sign(flight_path_data.roll) == sign(commanded_roll_rate))
 		{
 			// Linearly reduce our roll rate authority as we approach the maximum bank angle
-			auto clamping_zone_size = maximum_bank_angle - clamping_bank_angle;
-			auto clamping_zone_position = fabs(flight_path_data.roll) - clamping_bank_angle;
-			auto effectiveness = 1 - (clamping_zone_position / clamping_zone_size);
+			const auto clamping_zone_size = maximum_bank_angle - clamping_bank_angle;
+			const auto clamping_zone_position = fabs(flight_path_data.roll) - clamping_bank_angle;
+			const auto effectiveness = 1 - (clamping_zone_position / clamping_zone_size);
 			commanded_roll_rate *= effectiveness;
 		}
 	}
-	roll_rate_controller.Update(commanded_roll_rate - flight_path_data.roll_rate, dt);
+	control_surfaces.aileron = roll_rate_controller.Update(commanded_roll_rate - flight_path_data.roll_rate, dt);
 }
 
 bool HandleControlSurfaces(FsContext ctx, const int service_id, void* pData)
@@ -712,7 +757,7 @@ bool HandleControlSurfaces(FsContext ctx, const int service_id, void* pData)
         // - The dt member gives the time elapsed since last frame.
 		auto* p_draw_data = static_cast<sGaugeDrawData*>(pData);
 		auto dt = p_draw_data->dt;
-		control_surfaces.elevator = user_input.yoke_y;
+		FlightControlSystem_ManagePitchControl(dt);
 		FlightControlSystem_ManageRollControl(dt);
 		control_surfaces.rudder = user_input.rudder;
 		SimConnect_SetDataOnSimObject(hSimConnect, CONTROL_SURFACES_DEFINITION, SIMCONNECT_OBJECT_ID_USER, 0, 0, sizeof(control_surfaces), &control_surfaces);

@@ -45,11 +45,7 @@ public:
 		auto P = Kp * error;
 
 		// Integral term (trapezoidal area: assuming error moved linearly from last error to current error over dt)
-		if (Ki != 0)
-		{
-			integral += (last_error * dt) + (0.5 * dt * (error - last_error));
-			
-		}
+		integral += (last_error * dt) + (0.5 * dt * (error - last_error));
 		auto I = Ki * integral;
 
 		// Derivative term

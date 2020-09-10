@@ -246,8 +246,9 @@ bool HandleFlightPathDataUpdate(FsContext ctx, const int service_id, void* pData
 		flight_path_data.gforce_rate = (flight_path_data.gforce - last_gforce) / dt;
 			
 		// Update pitch info
+		auto last_pitch = flight_path_data.pitch;
 		flight_path_data.pitch = aircraft_varget(sim_vars.plane_pitch_degrees, sim_vars.degrees_units, 0);
-		flight_path_data.pitch_rate = aircraft_varget(sim_vars.rotation_velocity_body_y, sim_vars.degrees_per_second_units, 0);
+		flight_path_data.pitch_rate = (flight_path_data.pitch - last_pitch) / dt;
 
 		// Update roll info
 		double last_roll = flight_path_data.roll;
@@ -659,28 +660,60 @@ double FlightControlSystem_GetUserYokeXPosition()
 	return fabs(user_input.yoke_x) < null_zone_error ? 0 : user_input.yoke_x;
 }
 
-static PIDController gforce_rate_controller(-1, 1, 0.64, 0.32, 0.005);
+double locked_vertical_fpa = 0;
+double locked_pitch = 0;
+static PIDController gforce_rate_controller(-1, 1, 1, 0, 0);
+static PIDController hold_vertical_fpa_controller(-1, 1, 1, 0, 0);
+static PIDController hold_pitch_controller(-1, 1, 1, 0, 0);
+static PIDController pitch_rate_controller(-1, 1, 0.32, 0.32, 0);
 void FlightControlSystem_ManagePitchControl(const double dt)
 {
-	if (FlightControlSystem_GetUserYokeYPosition() == 0)
+	double commanded_pitch_rate;
+	if (FlightControlSystem_GetUserYokeYPosition() == 0 && FlightControlSystem_GetUserYokeXPosition() == 0)
 	{
-		gforce_rate_controller.Modify(-1, 1, 0.32, 0.16, 0);
+		// Neutral x and y = Hold FPA
+		locked_pitch = flight_path_data.pitch;
+		commanded_pitch_rate = hold_vertical_fpa_controller.Update(locked_vertical_fpa - flight_path_data.vertical_fpa, dt);
+		control_surfaces.elevator = pitch_rate_controller.Update(commanded_pitch_rate - flight_path_data.pitch_rate, dt);
+		printf("FPA_HOLD: CurFPA = %lf, DesFPA = %lf, CurPitchRate = %lf, DesPitchRate = %lf, Elev = %lf\n", flight_path_data.vertical_fpa, locked_vertical_fpa, flight_path_data.pitch_rate, commanded_pitch_rate, control_surfaces.elevator);
+	}
+	else if (FlightControlSystem_GetUserYokeYPosition() == 0)
+	{
+		if (fabs(flight_path_data.roll) > 33)
+		{
+			// Neutral y, but we're rolling and bank angle is > 33 degrees = Drop pitch to 1G LF
+			locked_pitch = flight_path_data.pitch;
+			locked_vertical_fpa = flight_path_data.vertical_fpa;
+			commanded_pitch_rate = gforce_rate_controller.Update(1 - flight_path_data.gforce, dt);
+			control_surfaces.elevator = pitch_rate_controller.Update(commanded_pitch_rate - flight_path_data.pitch_rate, dt);
+			printf("ROLL_1G: CurG = %lf, CurPitchRate = %lf, DesPitchRate = %lf, Elev = %lf\n", flight_path_data.gforce, flight_path_data.pitch_rate, commanded_pitch_rate, control_surfaces.elevator);
+		}
+		else
+		{
+			// Neutral y, but we're rolling and bank angle is <= 33 degrees = Hold pitch
+			locked_vertical_fpa = flight_path_data.vertical_fpa;
+			commanded_pitch_rate = hold_pitch_controller.Update(locked_pitch - flight_path_data.pitch, dt);
+			control_surfaces.elevator = pitch_rate_controller.Update(commanded_pitch_rate - flight_path_data.pitch_rate, dt);
+			printf("PITCH_HOLD: CurPitch = %lf, DesPitch = %lf, CurPitchRate = %lf, DesPitchRate = %lf, Elev = %lf\n", flight_path_data.pitch, locked_pitch, flight_path_data.pitch_rate, commanded_pitch_rate, control_surfaces.elevator);
+		}
 	}
 	else
 	{
-		gforce_rate_controller.Modify(-1, 1, 0.64, 0, 0.32);
-	}
-	
-	auto normal_load_factor = 1 / cos(radians(flight_path_data.roll));
+		locked_pitch = flight_path_data.pitch;
+		locked_vertical_fpa = flight_path_data.vertical_fpa;
+		
+		// Determine the normal load factor
+		auto normal_load_factor = 1 / cos(radians(flight_path_data.roll));
 
-	// Determine the user's load factor
-	auto requested_load_factor = 2 * FlightControlSystem_GetUserYokeYPosition() + normal_load_factor; // Linear relationship between request and actual value
-	requested_load_factor = clamp(requested_load_factor, -1, 2.5);
+		// Determine the user's load factor
+		auto requested_load_factor = 2 * FlightControlSystem_GetUserYokeYPosition() + normal_load_factor; // Linear relationship between request and actual value
+		requested_load_factor = clamp(requested_load_factor, -1, 2.5); // TODO: Adjust bounds for different configurations
 
-	auto current_load_factor = flight_path_data.gforce;
-	auto error = requested_load_factor - current_load_factor;
-	control_surfaces.elevator = gforce_rate_controller.Update(error, dt);
-	printf("GFORCE: CurrLF = %lf, NormLF = %lf, ReqLF = %lf, Error = %lf, Elevator = %lf\n", current_load_factor, normal_load_factor, requested_load_factor, error, control_surfaces.elevator);
+		// Command LF
+		commanded_pitch_rate = gforce_rate_controller.Update(requested_load_factor - flight_path_data.gforce, dt);
+		control_surfaces.elevator = pitch_rate_controller.Update(commanded_pitch_rate - flight_path_data.pitch_rate, dt);
+		printf("CMD_LF: CurLF = %lf, DesLF = %lf, CurPitchRate = %lf, DesPitchRate = %lf, Elev = %lf\n", flight_path_data.gforce, requested_load_factor, flight_path_data.pitch_rate, commanded_pitch_rate, control_surfaces.elevator);
+	}	
 }
 
 static PIDController roll_rate_controller(-1, 1, 0, 0, 0);

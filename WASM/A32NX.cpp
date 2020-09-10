@@ -22,6 +22,10 @@ constexpr double radians(double value)
 {
 	return value * (M_PI / 180);
 }
+constexpr double degrees(double value)
+{
+	return value * (180 / M_PI);
+}
 
 class PIDController
 {
@@ -53,6 +57,8 @@ public:
 
 		auto output = P + I + D;
 		output = clamp(output, output_min, output_max);
+
+		//printf("Err = %lf, Dt = %lf, LastErr = %lf, LastOut = %lf, Int = %lf, P = %lf, I = %lf, D = %lf, Out = %lf\n", error, dt, last_error, last_output, integral, P, I, D, output);
 
 		// Save terms
 		last_output = output;
@@ -207,16 +213,16 @@ bool HandleSimConnect(FsContext ctx, const int service_id, void* pData)
  */
 struct FLIGHT_PATH_DATA
 {
-	double gforce; // gforce
-	double gforce_rate; // gforce rate
-	double pitch; // degrees
-	double pitch_rate; // degrees per second
-	double roll; // degrees (rolled right == positive numbers, rolled left == negative numbers)
-	double roll_rate; // degrees per second
-	double vertical_fpa; // degrees
-	double vertical_fpa_rate; // degrees per second
-	double vertical_speed; // feet per second
-	double vertical_speed_rate; // feet per second per second
+	double gforce = 1; // gforce
+	double gforce_rate = 0; // gforce rate
+	double pitch = 0; // degrees
+	double pitch_rate = 0; // degrees per second
+	double roll = 0; // degrees (rolled right == positive numbers, rolled left == negative numbers)
+	double roll_rate = 0; // degrees per second
+	double vertical_fpa = 0; // degrees
+	double vertical_fpa_rate = 0; // degrees per second
+	double vertical_speed = 0; // feet per second
+	double vertical_speed_rate = 0; // feet per second per second
 } flight_path_data;
 
 bool HandleFlightPathDataUpdate(FsContext ctx, const int service_id, void* pData)
@@ -243,30 +249,42 @@ bool HandleFlightPathDataUpdate(FsContext ctx, const int service_id, void* pData
 		// Update gforce info
 		auto last_gforce = flight_path_data.gforce;
 		flight_path_data.gforce = aircraft_varget(sim_vars.gforce, sim_vars.gforce_units, 0);
+		flight_path_data.gforce = isnan(flight_path_data.gforce) ? 1 : flight_path_data.gforce;
 		flight_path_data.gforce_rate = (flight_path_data.gforce - last_gforce) / dt;
 			
 		// Update pitch info
 		auto last_pitch = flight_path_data.pitch;
-		flight_path_data.pitch = aircraft_varget(sim_vars.plane_pitch_degrees, sim_vars.degrees_units, 0);
+		flight_path_data.pitch = -aircraft_varget(sim_vars.plane_pitch_degrees, sim_vars.degrees_units, 0);
+		flight_path_data.pitch = isnan(flight_path_data.pitch) ? 0 : flight_path_data.pitch;
 		flight_path_data.pitch_rate = (flight_path_data.pitch - last_pitch) / dt;
 
 		// Update roll info
 		double last_roll = flight_path_data.roll;
 		flight_path_data.roll = -aircraft_varget(sim_vars.plane_bank_degrees, sim_vars.degrees_units, 0);
+		flight_path_data.roll = isnan(flight_path_data.roll) ? 0 : flight_path_data.roll;
 		flight_path_data.roll_rate = (flight_path_data.roll - last_roll) / dt;
 
 		// Update vertical fpa info
 		const auto last_vertical_fpa = flight_path_data.vertical_fpa;
 		// Vertical FPA = arctan(vertical speed / true airspeed)
-		const auto vertical_speed = aircraft_varget(sim_vars.vertical_speed, sim_vars.feet_per_second_units, 0);
-		const auto true_airspeed = aircraft_varget(sim_vars.airspeed_true, sim_vars.knots_units, 0);
-		const auto knots_to_feet_per_minute_ratio = (60.0 / 1.0) * (1.0 / 6076.0); // (60 min / 1 h) * (1 nm / 6076 ft)
-		flight_path_data.vertical_fpa = atan(vertical_speed * (1 / true_airspeed) * knots_to_feet_per_minute_ratio) * (180 / M_PI);
+		auto vertical_speed = aircraft_varget(sim_vars.vertical_speed, sim_vars.feet_per_second_units, 0);
+		vertical_speed = isnan(vertical_speed) ? 0 : vertical_speed;
+		auto true_airspeed = aircraft_varget(sim_vars.airspeed_true, sim_vars.knots_units, 0);
+		true_airspeed = isnan(true_airspeed) ? 0 : true_airspeed;
+		if (true_airspeed == 0 && vertical_speed == 0) flight_path_data.vertical_fpa = 0; // neutral
+		else if (true_airspeed == 0 && vertical_speed < 0) flight_path_data.vertical_fpa = -90; // straight down
+		else if (true_airspeed == 0 && vertical_speed > 0) flight_path_data.vertical_fpa = 90; // straight up
+		else
+		{
+			const auto knots_to_feet_per_minute_ratio = (60.0 / 1.0) * (1.0 / 6076.0); // (60 min / 1 h) * (1 nm / 6076 ft)
+			flight_path_data.vertical_fpa = degrees(atan(vertical_speed * (1 / true_airspeed) * knots_to_feet_per_minute_ratio));
+		}
 		flight_path_data.vertical_fpa_rate = (flight_path_data.vertical_fpa - last_vertical_fpa) / dt;
 
 		// Update vertical speed info
 		const auto last_vertical_speed = flight_path_data.vertical_speed;
 		flight_path_data.vertical_speed = aircraft_varget(sim_vars.vertical_speed, sim_vars.feet_per_second_units, 0);
+		flight_path_data.vertical_speed = isnan(flight_path_data.vertical_speed) ? 0 : flight_path_data.vertical_speed;
 		flight_path_data.vertical_speed_rate = (flight_path_data.vertical_speed - last_vertical_speed) / dt;
 
 		return true;
@@ -415,9 +433,9 @@ void PitchControlMode_HandleFlareTransitions(const double dt)
 	{
 		if (InNormalLaw())
 		{
-			auto radio_altimeter = aircraft_varget(sim_vars.radio_height, sim_vars.feet_units, 0);
-			auto on_ground = aircraft_varget(sim_vars.sim_on_ground, sim_vars.bool_units, 0) != 0;
-			auto pitch_attitude = aircraft_varget(sim_vars.plane_pitch_degrees, sim_vars.degrees_units, 0);
+			const auto radio_altimeter = aircraft_varget(sim_vars.radio_height, sim_vars.feet_units, 0);
+			const auto on_ground = aircraft_varget(sim_vars.sim_on_ground, sim_vars.bool_units, 0) != 0;
+			const auto pitch_attitude = aircraft_varget(sim_vars.plane_pitch_degrees, sim_vars.degrees_units, 0);
 			// Handle flare to flight transition
 			if (radio_altimeter > 50)
 			{
@@ -649,117 +667,132 @@ enum DEFINITION_ID
 double FlightControlSystem_GetUserYokeYPosition()
 {
 	// Get the user stick position with a null zone
-	auto null_zone_error = 0.05 * 2; // 5% of the stick movement is null (2 units of total travel distance over [-1,1])
+	const auto null_zone_error = 0.05 * 2; // 5% of the stick movement is null (2 units of total travel distance over [-1,1])
 	return fabs(user_input.yoke_y) < null_zone_error ? 0 : user_input.yoke_y;
 }
 
 double FlightControlSystem_GetUserYokeXPosition()
 {
 	// Get the user stick position with a null zone
-	auto null_zone_error = 0.05 * 2; // 5% of the stick movement is null (2 units of total travel distance over [-1,1])
+	const auto null_zone_error = 0.05 * 2; // 5% of the stick movement is null (2 units of total travel distance over [-1,1])
 	return fabs(user_input.yoke_x) < null_zone_error ? 0 : user_input.yoke_x;
 }
 
 double locked_vertical_fpa = 0;
 double locked_pitch = 0;
-static PIDController gforce_rate_controller(-1, 1, 1, 0, 0);
-static PIDController hold_vertical_fpa_controller(-1, 1, 1, 0, 0);
-static PIDController hold_pitch_controller(-1, 1, 1, 0, 0);
-static PIDController pitch_rate_controller(-1, 1, 0.32, 0.32, 0);
+static PIDController gforce_rate_controller(-10, 10, 1, 0, 0);
+static PIDController hold_vertical_fpa_controller(-10, 10, 0.0001, 0, 0);
+static PIDController hold_pitch_controller(-10, 10, 1, 0, 0);
+static PIDController pitch_rate_controller(-1, 1, 0.16, 1.28, 0);
 void FlightControlSystem_ManagePitchControl(const double dt)
 {
-	double commanded_pitch_rate;
-	if (FlightControlSystem_GetUserYokeYPosition() == 0 && FlightControlSystem_GetUserYokeXPosition() == 0)
+	if (pitch_control_mode == FLIGHT_MODE)
 	{
-		// Neutral x and y = Hold FPA
-		locked_pitch = flight_path_data.pitch;
-		commanded_pitch_rate = hold_vertical_fpa_controller.Update(locked_vertical_fpa - flight_path_data.vertical_fpa, dt);
-		control_surfaces.elevator = pitch_rate_controller.Update(commanded_pitch_rate - flight_path_data.pitch_rate, dt);
-		printf("FPA_HOLD: CurFPA = %lf, DesFPA = %lf, CurPitchRate = %lf, DesPitchRate = %lf, Elev = %lf\n", flight_path_data.vertical_fpa, locked_vertical_fpa, flight_path_data.pitch_rate, commanded_pitch_rate, control_surfaces.elevator);
-	}
-	else if (FlightControlSystem_GetUserYokeYPosition() == 0)
-	{
-		if (fabs(flight_path_data.roll) > 33)
+		double commanded_pitch_rate;
+		if (FlightControlSystem_GetUserYokeYPosition() == 0 && FlightControlSystem_GetUserYokeXPosition() == 0)
 		{
-			// Neutral y, but we're rolling and bank angle is > 33 degrees = Drop pitch to 1G LF
+			// Neutral x and y = Hold FPA
 			locked_pitch = flight_path_data.pitch;
-			locked_vertical_fpa = flight_path_data.vertical_fpa;
-			commanded_pitch_rate = gforce_rate_controller.Update(1 - flight_path_data.gforce, dt);
-			control_surfaces.elevator = pitch_rate_controller.Update(commanded_pitch_rate - flight_path_data.pitch_rate, dt);
-			printf("ROLL_1G: CurG = %lf, CurPitchRate = %lf, DesPitchRate = %lf, Elev = %lf\n", flight_path_data.gforce, flight_path_data.pitch_rate, commanded_pitch_rate, control_surfaces.elevator);
+			auto fpa_error = locked_vertical_fpa - flight_path_data.vertical_fpa;
+			commanded_pitch_rate = hold_vertical_fpa_controller.Update(fpa_error, dt);
+			auto pitch_rate_error = commanded_pitch_rate - flight_path_data.pitch_rate;
+			control_surfaces.elevator = pitch_rate_controller.Update(pitch_rate_error, dt);
+			printf("FPA_HOLD: CurFPA = %lf, DesFPA = %lf, FPAError = %lf, CurPitch = %lf, CurPitchRate = %lf, DesPitchRate = %lf, PRErr = %lf, Elev = %lf\n", flight_path_data.vertical_fpa, locked_vertical_fpa, fpa_error, flight_path_data.pitch, flight_path_data.pitch_rate, commanded_pitch_rate, pitch_rate_error, control_surfaces.elevator);
+		}
+		else if (FlightControlSystem_GetUserYokeYPosition() == 0)
+		{
+			if (fabs(flight_path_data.roll) > 33)
+			{
+				// Neutral y, but we're rolling and bank angle is > 33 degrees = Drop pitch to 1G LF
+				locked_pitch = flight_path_data.pitch;
+				locked_vertical_fpa = flight_path_data.vertical_fpa;
+				commanded_pitch_rate = gforce_rate_controller.Update(1 - flight_path_data.gforce, dt);
+				control_surfaces.elevator = pitch_rate_controller.Update(commanded_pitch_rate - flight_path_data.pitch_rate, dt);
+				printf("ROLL_1G: CurG = %lf, CurPitchRate = %lf, DesPitchRate = %lf, Elev = %lf\n", flight_path_data.gforce, flight_path_data.pitch_rate, commanded_pitch_rate, control_surfaces.elevator);
+			}
+			else
+			{
+				// Neutral y, but we're rolling and bank angle is <= 33 degrees = Hold pitch
+				locked_vertical_fpa = flight_path_data.vertical_fpa;
+				commanded_pitch_rate = hold_pitch_controller.Update(locked_pitch - flight_path_data.pitch, dt);
+				control_surfaces.elevator = pitch_rate_controller.Update(commanded_pitch_rate - flight_path_data.pitch_rate, dt);
+				printf("PITCH_HOLD: CurPitch = %lf, DesPitch = %lf, CurPitchRate = %lf, DesPitchRate = %lf, Elev = %lf\n", flight_path_data.pitch, locked_pitch, flight_path_data.pitch_rate, commanded_pitch_rate, control_surfaces.elevator);
+			}
 		}
 		else
 		{
-			// Neutral y, but we're rolling and bank angle is <= 33 degrees = Hold pitch
+			locked_pitch = flight_path_data.pitch;
 			locked_vertical_fpa = flight_path_data.vertical_fpa;
-			commanded_pitch_rate = hold_pitch_controller.Update(locked_pitch - flight_path_data.pitch, dt);
+
+			// Determine the normal load factor
+			auto normal_load_factor = 1 / cos(radians(flight_path_data.roll));
+
+			// Determine the user's load factor
+			auto requested_load_factor = 2 * FlightControlSystem_GetUserYokeYPosition() + normal_load_factor; // Linear relationship between request and actual value
+			requested_load_factor = clamp(requested_load_factor, -1, 2.5); // TODO: Adjust bounds for different configurations
+
+			// Command LF
+			commanded_pitch_rate = gforce_rate_controller.Update(requested_load_factor - flight_path_data.gforce, dt);
 			control_surfaces.elevator = pitch_rate_controller.Update(commanded_pitch_rate - flight_path_data.pitch_rate, dt);
-			printf("PITCH_HOLD: CurPitch = %lf, DesPitch = %lf, CurPitchRate = %lf, DesPitchRate = %lf, Elev = %lf\n", flight_path_data.pitch, locked_pitch, flight_path_data.pitch_rate, commanded_pitch_rate, control_surfaces.elevator);
+			printf("CMD_LF: CurLF = %lf, DesLF = %lf, CurPitchRate = %lf, DesPitchRate = %lf, Elev = %lf\n", flight_path_data.gforce, requested_load_factor, flight_path_data.pitch_rate, commanded_pitch_rate, control_surfaces.elevator);
 		}
 	}
 	else
 	{
-		locked_pitch = flight_path_data.pitch;
-		locked_vertical_fpa = flight_path_data.vertical_fpa;
-		
-		// Determine the normal load factor
-		auto normal_load_factor = 1 / cos(radians(flight_path_data.roll));
-
-		// Determine the user's load factor
-		auto requested_load_factor = 2 * FlightControlSystem_GetUserYokeYPosition() + normal_load_factor; // Linear relationship between request and actual value
-		requested_load_factor = clamp(requested_load_factor, -1, 2.5); // TODO: Adjust bounds for different configurations
-
-		// Command LF
-		commanded_pitch_rate = gforce_rate_controller.Update(requested_load_factor - flight_path_data.gforce, dt);
-		control_surfaces.elevator = pitch_rate_controller.Update(commanded_pitch_rate - flight_path_data.pitch_rate, dt);
-		printf("CMD_LF: CurLF = %lf, DesLF = %lf, CurPitchRate = %lf, DesPitchRate = %lf, Elev = %lf\n", flight_path_data.gforce, requested_load_factor, flight_path_data.pitch_rate, commanded_pitch_rate, control_surfaces.elevator);
-	}	
+		control_surfaces.elevator = user_input.yoke_y;
+	}
 }
 
 static PIDController roll_rate_controller(-1, 1, 0, 0, 0);
 void FlightControlSystem_ManageRollControl(const double dt)
 {
 	// TODO: Handle other laws
-	
-	const auto maximum_bank_angle = 67; // Maximum bank angle // TODO: Change this when other kinds of protections are active
-	const auto clamping_bank_angle = maximum_bank_angle - 10; // Bank angle at which to clamp roll response // TODO: Tuning?
-	const auto nominal_bank_angle = 33; // Maximum bank angle allowed for turns // TODO: Change this when other kinds of protections are active
+	if (pitch_control_mode == FLIGHT_MODE)
+	{
+		const auto maximum_bank_angle = 67; // Maximum bank angle // TODO: Change this when other kinds of protections are active
+		const auto clamping_bank_angle = maximum_bank_angle - 10; // Bank angle at which to clamp roll response // TODO: Tuning?
+		const auto nominal_bank_angle = 33; // Maximum bank angle allowed for turns // TODO: Change this when other kinds of protections are active
 
-	auto commanded_roll_rate = 15 * FlightControlSystem_GetUserYokeXPosition(); // degrees per second
-	
-	if (commanded_roll_rate == 0)
-	{		
-		// We should be holding the specified angle
-		roll_rate_controller.Modify(-0.25, 0.25, 0.32, 0.32, 0);
+		auto commanded_roll_rate = 15 * FlightControlSystem_GetUserYokeXPosition(); // degrees per second
 
-		// If we are banked beyond the nominal bank angle, roll back to the nominal bank angle
-		if (fabs(flight_path_data.roll) > nominal_bank_angle)
+		if (commanded_roll_rate == 0)
 		{
-			commanded_roll_rate = 5 * -sign(flight_path_data.roll); // roll opposite at 5 degrees per second // TODO: Tuning?
+			// We should be holding the specified angle
+			roll_rate_controller.Modify(-0.25, 0.25, 0.32, 0.32, 0);
+
+			// If we are banked beyond the nominal bank angle, roll back to the nominal bank angle
+			if (fabs(flight_path_data.roll) > nominal_bank_angle)
+			{
+				commanded_roll_rate = 5 * -sign(flight_path_data.roll); // roll opposite at 5 degrees per second // TODO: Tuning?
+			}
 		}
+		else
+		{
+			// We should be responsive to the user's roll request
+			roll_rate_controller.Modify(-1, 1, 0.64, 0, 0);
+
+			// Check if we are overbanked
+			if (fabs(flight_path_data.roll) > maximum_bank_angle)
+			{
+				// Apply overbank protections
+				commanded_roll_rate = 5 * -sign(flight_path_data.roll); // roll opposite at 5 degrees per second // TODO: Tuning?
+			}
+			// Check if we are approaching overbank
+			else if (fabs(flight_path_data.roll) > clamping_bank_angle && sign(flight_path_data.roll) == sign(commanded_roll_rate))
+			{
+				// Linearly reduce our roll rate authority as we approach the maximum bank angle
+				const auto clamping_zone_size = maximum_bank_angle - clamping_bank_angle;
+				const auto clamping_zone_position = fabs(flight_path_data.roll) - clamping_bank_angle;
+				const auto effectiveness = 1 - (clamping_zone_position / clamping_zone_size);
+				commanded_roll_rate *= effectiveness;
+			}
+		}
+		control_surfaces.aileron = roll_rate_controller.Update(commanded_roll_rate - flight_path_data.roll_rate, dt);
 	}
 	else
 	{
-		// We should be responsive to the user's roll request
-		roll_rate_controller.Modify(-1, 1, 0.64, 0, 0);
-		
-		// Check if we are overbanked
-		if (fabs(flight_path_data.roll) > maximum_bank_angle)
-		{
-			// Apply overbank protections
-			commanded_roll_rate = 5 * -sign(flight_path_data.roll); // roll opposite at 5 degrees per second // TODO: Tuning?
-		}
-		// Check if we are approaching overbank
-		else if (fabs(flight_path_data.roll) > clamping_bank_angle && sign(flight_path_data.roll) == sign(commanded_roll_rate))
-		{
-			// Linearly reduce our roll rate authority as we approach the maximum bank angle
-			const auto clamping_zone_size = maximum_bank_angle - clamping_bank_angle;
-			const auto clamping_zone_position = fabs(flight_path_data.roll) - clamping_bank_angle;
-			const auto effectiveness = 1 - (clamping_zone_position / clamping_zone_size);
-			commanded_roll_rate *= effectiveness;
-		}
+		control_surfaces.aileron = user_input.yoke_x;
 	}
-	control_surfaces.aileron = roll_rate_controller.Update(commanded_roll_rate - flight_path_data.roll_rate, dt);
 }
 
 bool HandleControlSurfaces(FsContext ctx, const int service_id, void* pData)

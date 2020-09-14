@@ -118,6 +118,7 @@ struct SIM_VARS
 	ENUM airspeed_indicated; // AIRSPEED INDICATED
 	ENUM airspeed_mach; // AIRSPEED MACH
 	ENUM airspeed_true; // AIRSPEED TRUE
+	ENUM autopilot_master; // AUTOPILOT MASTER
 	ENUM barber_pole_mach; // BARBER POLE MACH
 	ENUM elevator_deflection; // ELEVATOR DEFLECTION
 	ENUM elevator_deflection_pct; // ELEVATOR DEFLECTION PCT
@@ -157,6 +158,7 @@ bool HandleSimVars(FsContext ctx, const int service_id, void* pData)
 		sim_vars.airspeed_indicated = get_aircraft_var_enum("AIRSPEED INDICATED");
 		sim_vars.airspeed_mach = get_aircraft_var_enum("AIRSPEED MACH");
 		sim_vars.airspeed_true = get_aircraft_var_enum("AIRSPEED TRUE");
+		sim_vars.autopilot_master = get_aircraft_var_enum("AUTOPILOT MASTER");
 		sim_vars.barber_pole_mach = get_aircraft_var_enum("BARBER POLE MACH");
 		sim_vars.elevator_deflection = get_aircraft_var_enum("ELEVATOR DEFLECTION");
 		sim_vars.elevator_deflection_pct = get_aircraft_var_enum("ELEVATOR DEFLECTION PCT");
@@ -248,10 +250,11 @@ struct FLIGHT_PATH_DATA
 {
 	double airspeed_indicated = 0; // knots
 	double airspeed_mach = 0; // mach
+	bool autopilot_enabled = false; // autopilot enabled
 	double aoa = 0; // degrees
 	double gforce = 1; // gforce
 	double gforce_rate = 0; // gforce rate
-	double flaps_pos = 0; // number (0-4)
+	int flaps_pos = 0; // number (0-4)
 	double mmo = DBL_MAX; // mach
 	double pitch = 0; // degrees
 	double pitch_rate = 0; // degrees per second
@@ -334,7 +337,10 @@ bool HandleFlightPathDataUpdate(FsContext ctx, const int service_id, void* pData
 		// Update AoA info
 		flight_path_data.aoa = aircraft_varget(sim_vars.incidence_alpha, sim_vars.degrees_units, 0);
 		flight_path_data.aoa = isnan(flight_path_data.aoa) ? 0 : flight_path_data.aoa;
-			
+
+		// Update autopilot info
+		flight_path_data.autopilot_enabled = aircraft_varget(sim_vars.autopilot_master, sim_vars.bool_units, 0) == 1.0;
+
 		// Update gforce info
 		auto last_gforce = flight_path_data.gforce;
 		flight_path_data.gforce = aircraft_varget(sim_vars.gforce, sim_vars.gforce_units, 0);
@@ -975,9 +981,9 @@ double FlightControlSystem_ApplyHighSpeedProtection(double commanded_pitch_rate)
 	return commanded_pitch_rate;
 }
 
-static PIDController aoa_controller(-5, 5, 6, 0, 1);
+static PIDController aoa_controller(-5, 5, 4, 0, 0.1);
 static PIDController gforce_rate_controller(-10, 10, 16, 0, 0);
-static PIDController hold_vertical_fpa_rate_controller(-2, 2, 16, 16, 2);
+static PIDController hold_vertical_fpa_rate_controller(-3, 3, 16, 16, 1);
 static PIDController hold_pitch_controller(-2, 2, 6, 0, 1);
 static AntiWindupPIDController pitch_rate_controller(-1, 1, 0.32, 0.32, 0.005);
 void FlightControlSystem_ManagePitchControl(const double t, const double dt)
@@ -1183,9 +1189,17 @@ bool HandleControlSurfaces(FsContext ctx, const int service_id, void* pData)
 		auto* p_draw_data = static_cast<sGaugeDrawData*>(pData);
 		auto t = p_draw_data->t;
 		auto dt = p_draw_data->dt;
-		FlightControlSystem_ManagePitchControl(t, dt);
-		FlightControlSystem_ManageRollControl(dt);
-		control_surfaces.rudder = user_input.rudder;
+		if (!flight_path_data.autopilot_enabled) {
+			FlightControlSystem_ManagePitchControl(t, dt);
+			FlightControlSystem_ManageRollControl(dt);
+			control_surfaces.rudder = user_input.rudder;
+		}
+		else
+		{
+			control_surfaces.elevator = user_input.yoke_y;
+			control_surfaces.aileron = user_input.yoke_x;
+			control_surfaces.rudder = user_input.rudder;
+		}
 		SimConnect_SetDataOnSimObject(hSimConnect, CONTROL_SURFACES_DEFINITION, SIMCONNECT_OBJECT_ID_USER, 0, 0, sizeof(control_surfaces), &control_surfaces);
 		return true;
 	}

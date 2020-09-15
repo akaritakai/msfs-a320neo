@@ -14,17 +14,50 @@ constexpr double sign(double value)
 {
 	return (value > 0) ? 1.0 : -1.0;
 }
-constexpr double clamp(double value, double min, double max)
+constexpr double clamp(const double value, const double min, const double max)
 {
 	return (value < min) ? min : (value > max) ? max : value;
 }
-constexpr double radians(double value)
+constexpr double radians(const double value)
 {
 	return value * (M_PI / 180);
 }
-constexpr double degrees(double value)
+constexpr double degrees(const double value)
 {
 	return value * (180 / M_PI);
+}
+constexpr bool is_between(const double value, const double left, const double right, const bool strictly)
+{
+	const auto min = min(left, right);
+	const auto max = max(left, right);
+	return strictly ? value > min && value < max : value >= min && value <= max;
+}
+constexpr double linear_decay_coefficient(const double position, const double start, const double end)
+{
+	// This function provides a coefficient such that the effectiveness is maximal (1.0) before the start,
+	// reduces linearly up to the end, and after which is no longer effective (0.0).
+	//
+	// Effect in the positive direction:
+	// <--- maximum effectiveness (1.0) ---> start <--- linear change to effectiveness ---> end <--- no effectiveness (0.0) --->
+	// Effect in the negative direction:
+	// <--- no effectiveness (0.0) ---> end <--- linear change to effectiveness ---> start <--- maximum effectiveness (1.0) --->
+
+	if ((start < end && position <= start) || (start >= end && position >= start))
+	{
+		return 1.0;
+	}
+	else if ((start < end && position >= end) || (start >= end && position <= end))
+	{
+		return 0.0;
+	}
+	else
+	{
+		return 1.0 - ((position - start) / (end - start));
+	}
+}
+constexpr double linear_range(const double coefficient, const double min, const double max)
+{
+	return (max - min) * coefficient + min;
 }
 
 class PIDController
@@ -242,9 +275,13 @@ bool HandleSimConnect(FsContext ctx, const int service_id, void* pData)
 }
 
 /*
- * ===================== *
- * Flight Path Variables *
- * ===================== *
+ * ============================== *
+ * Flight Controls/Path Variables *
+ * ============================== *
+ */
+
+/*
+ * Describes the current status of the plane
  */
 struct FLIGHT_PATH_DATA
 {
@@ -258,6 +295,7 @@ struct FLIGHT_PATH_DATA
 	double mmo = DBL_MAX; // mach
 	double pitch = 0; // degrees
 	double pitch_rate = 0; // degrees per second
+	double radio_height = 0; // feet
 	double roll = 0; // degrees (rolled right == positive numbers, rolled left == negative numbers)
 	double roll_rate = 0; // degrees per second
 	double stall_alpha = DBL_MAX; // degrees
@@ -272,35 +310,47 @@ struct FLIGHT_PATH_DATA
 
 double GetAlphaFloorAngle()
 {
-	// These values are hardcoded in the FCOM
-	if (flight_path_data.flaps_pos == 1.0 || flight_path_data.flaps_pos == 2.0)
+	// These values are hardcoded in the FCOM in 1.27.20 under "High Angle of Attack Protection"
+	// Note: 2. a.floor is activated through A/THR system when:
+	// - a > a floor (9.5 degrees in configuration 0; 15 degrees in configuration 1, 2; 14 degrees in
+	//   configuration 3; 13 degrees in configuration FULL), or,...
+	switch (flight_path_data.flaps_pos)
 	{
-		return 15;
-	}
-	else if (flight_path_data.flaps_pos == 3.0)
-	{
-		return 14;
-	}
-	else if (flight_path_data.flaps_pos == 4.0)
-	{
-		return 13;
-	}
-	else
-	{
+	case 0: // Flaps up
 		return 9.5;
+		break;
+	case 1: // Flaps 1
+		return 15;
+		break;
+	case 2: // Flaps 2
+		return 15;
+		break;
+	case 3: // Flaps 3
+		return 14;
+		break;
+	case 4: // Flaps full
+		return 13;
+		break;
+	default: // Unreachable
+		return 9.5;
+		break;
 	}
 }
 
 double GetAlphaProtAngle()
 {
-	// This ratio was estimated using the graph in the FCOM
+	// This ratio was estimated using the graph in the FCOM in 1.27.20 under "High Angle of Attack Protection"
+	// The graph plots CL (lift coefficient) to alpha.
+	// The ratio was guesstimated using a ruler and hoping the graph was accurate.
 	const auto ratio_with_alpha_floor = 19.0 / 21.0;
 	return ratio_with_alpha_floor * GetAlphaFloorAngle();
 }
 
 double GetAlphaMaxAngle()
 {
-	// This ratio was estimated using the graph in the FCOM
+	// This ratio was estimated using the graph in the FCOM in 1.27.20 under "High Angle of Attack Protection"
+	// The graph plots CL (lift coefficient) to alpha.
+	// The ratio was guesstimated using a ruler and hoping the graph was accurate.
 	const auto ratio_with_alpha_floor = 7.0 / 6.0;
 	return ratio_with_alpha_floor * GetAlphaFloorAngle();
 }
@@ -361,6 +411,10 @@ bool HandleFlightPathDataUpdate(FsContext ctx, const int service_id, void* pData
 		flight_path_data.pitch = isnan(flight_path_data.pitch) ? 0 : flight_path_data.pitch;
 		flight_path_data.pitch_rate = (flight_path_data.pitch - last_pitch) / dt;
 
+		// Update radio height
+		flight_path_data.radio_height = aircraft_varget(sim_vars.radio_height, sim_vars.feet_units, 0);
+		flight_path_data.radio_height = isnan(flight_path_data.radio_height) ? 0 : flight_path_data.radio_height;
+			
 		// Update roll info
 		double last_roll = flight_path_data.roll;
 		flight_path_data.roll = -aircraft_varget(sim_vars.plane_bank_degrees, sim_vars.degrees_units, 0);
@@ -469,6 +523,7 @@ PITCH_CONTROL_MODE pitch_control_mode = GROUND_MODE;
 double pitch_control_mode_ground_effect = 1.0;
 double pitch_control_mode_flight_effect = 0.0;
 double pitch_control_mode_flare_effect = 0.0;
+double saved_flare_pitch_attitude = 0; // The attitude of the airplane at 50 feet RA
 const char* PITCH_CONTROL_MODE_VAR_NAME = "PITCH CONTROL MODE";
 
 void PitchControlMode_BlendEffect(double * blend_in, double * blend_out, const double increment)
@@ -480,62 +535,64 @@ void PitchControlMode_BlendEffect(double * blend_in, double * blend_out, const d
 double ground_to_flight_condition_start_time = 0;
 void PitchControlMode_HandleGroundTransitions(const double dt)
 {
-	if (pitch_control_mode == GROUND_MODE)
+	if (InNormalLaw())
 	{
-		if (InNormalLaw())
+		// Handle ground to flight transition
+		auto radio_altimeter = aircraft_varget(sim_vars.radio_height, sim_vars.feet_units, 0);
+		auto in_flight = aircraft_varget(sim_vars.sim_on_ground, sim_vars.bool_units, 0) == 0;
+		auto pitch_attitude = aircraft_varget(sim_vars.plane_pitch_degrees, sim_vars.degrees_units, 0);
+		if ((radio_altimeter > 50) || (in_flight && (pitch_attitude > 8)))
 		{
-			// Handle ground to flight transition
-			auto radio_altimeter = aircraft_varget(sim_vars.radio_height, sim_vars.feet_units, 0);
-			auto in_flight = aircraft_varget(sim_vars.sim_on_ground, sim_vars.bool_units, 0) == 0;
-			auto pitch_attitude = aircraft_varget(sim_vars.plane_pitch_degrees, sim_vars.degrees_units, 0);
-			if ((radio_altimeter > 50) || (in_flight && (pitch_attitude > 8)))
+			// Blend in flight effect and blend out ground effect
+			PitchControlMode_BlendEffect(&pitch_control_mode_flight_effect, &pitch_control_mode_ground_effect, dt / 5);
+			if (pitch_control_mode_flight_effect == 1)
 			{
-				// Blend in flight effect and blend out ground effect
-				PitchControlMode_BlendEffect(&pitch_control_mode_flight_effect, &pitch_control_mode_ground_effect, dt / 5);
-				if (pitch_control_mode_flight_effect == 1)
-				{
-					pitch_control_mode = FLIGHT_MODE;
-					pitch_control_mode_ground_effect = 0;
-					pitch_control_mode_flare_effect = 0;
-				}
-			}
-			else
-			{
-				// Blend in ground effect and blend out flight effect
-				PitchControlMode_BlendEffect(&pitch_control_mode_ground_effect, &pitch_control_mode_flight_effect, dt / 5);
+				pitch_control_mode = FLIGHT_MODE;
+				pitch_control_mode_ground_effect = 0;
+				pitch_control_mode_flare_effect = 0;
 			}
 		}
-		// TODO: Handle other laws
+		else
+		{
+			// Blend in ground effect and blend out flight effect
+			PitchControlMode_BlendEffect(&pitch_control_mode_ground_effect, &pitch_control_mode_flight_effect, dt / 5);
+		}
 	}
+	// TODO: Handle other laws
 }
 
 void PitchControlMode_HandleFlightTransitions(const double dt)
 {
-	if (pitch_control_mode == FLIGHT_MODE)
+	if (InNormalLaw())
 	{
-		if (InNormalLaw())
+		// Handle flight to flare transition
+		auto radio_altimeter = aircraft_varget(sim_vars.radio_height, sim_vars.feet_units, 0);
+		if (radio_altimeter <= 50)
 		{
-			// Handle flight to flare transition
-			auto radio_altimeter = aircraft_varget(sim_vars.radio_height, sim_vars.feet_units, 0);
-			if (radio_altimeter < 50)
+			if (pitch_control_mode_flare_effect == 0)
 			{
-				// Blend in flare effect and blend out flight effect
-				PitchControlMode_BlendEffect(&pitch_control_mode_flare_effect, &pitch_control_mode_flight_effect, dt / 1);
-				if (pitch_control_mode_flare_effect == 1)
-				{
-					pitch_control_mode = FLARE_MODE;
-					pitch_control_mode_ground_effect = 0;
-					pitch_control_mode_flight_effect = 0;
-				}
+				// First time blending in flare, so let's save the pitch attitude
+				// Why? The FCOM says so:
+				// "The system memorizes the attitude at 50 feet, and that attitude becomes the initial reference for pitch attitude control."
+				saved_flare_pitch_attitude = flight_path_data.pitch;
 			}
-			else
+			
+			// Blend in flare effect and blend out flight effect
+			PitchControlMode_BlendEffect(&pitch_control_mode_flare_effect, &pitch_control_mode_flight_effect, dt / 1);
+			if (pitch_control_mode_flare_effect == 1)
 			{
-				// Blend in flight effect and blend out flare effect
-				PitchControlMode_BlendEffect(&pitch_control_mode_flight_effect, &pitch_control_mode_flare_effect, dt / 1);
+				pitch_control_mode = FLARE_MODE;
+				pitch_control_mode_ground_effect = 0;
+				pitch_control_mode_flight_effect = 0;
 			}
 		}
-		// TODO: Handle other laws
+		else
+		{
+			// Blend in flight effect and blend out flare effect
+			PitchControlMode_BlendEffect(&pitch_control_mode_flight_effect, &pitch_control_mode_flare_effect, dt / 1);
+		}
 	}
+	// TODO: Handle other laws
 }
 
 void PitchControlMode_HandleFlareTransitions(const double dt)
@@ -650,14 +707,13 @@ enum GROUP_ID
 enum EVENT_ID
 {
 	// Elevator Group
-	AXIS_ELEVATOR_SET_EVENT,
+	ELEVATOR_SET_EVENT, // AXIS_ELEVATOR_SET
 	// Aileron Group
-	AXIS_AILERONS_SET_EVENT,
-	CENTER_AILERONS_RUDDER_EVENT,
+	AILERONS_SET_EVENT, // AXIS_AILERONS_SET
+	CENTER_AILERONS_RUDDER_EVENT, // CENTER_AILER_RUDDER
 	// Rudder group
-	AXIS_RUDDER_SET_EVENT,
-	RUDDER_SET_EVENT,
-	RUDDER_CENTER_EVENT
+	RUDDER_SET_EVENT, // AXIS_RUDDER_SET
+	RUDDER_CENTER_EVENT, // RUDDER_CENTER
 };
 
 /*
@@ -677,18 +733,15 @@ void CALLBACK OnInputCaptureEvent(SIMCONNECT_RECV* pData, DWORD cbData, void* pC
 		auto evt = static_cast<SIMCONNECT_RECV_EVENT*>(pData);
 		switch (evt->uEventID)
 		{
-		case AXIS_ELEVATOR_SET_EVENT:
+		case ELEVATOR_SET_EVENT:
 			user_input.yoke_y = 0 - (static_cast<long>(evt->dwData) / 16384.0); // scale from [-16384,16384] to [-1,1] and reverse the sign
 			break;
-		case AXIS_AILERONS_SET_EVENT:
+		case AILERONS_SET_EVENT:
 			user_input.yoke_x = 0 - (static_cast<long>(evt->dwData) / 16384.0); // scale from [-16384,16384] to [-1,1] and reverse the sign
 			break;
 		case CENTER_AILERONS_RUDDER_EVENT:
 			user_input.yoke_x = 0;
 			user_input.rudder = 0;
-			break;
-		case AXIS_RUDDER_SET_EVENT:
-			user_input.rudder = 0 - (static_cast<long>(evt->dwData) / 16384.0); // scale from [-16384,16384] to [-1,1] and reverse the sign
 			break;
 		case RUDDER_SET_EVENT:
 			user_input.rudder = 0 - (static_cast<long>(evt->dwData) / 16384.0); // scale from [-16384,16384] to [-1,1] and reverse the sign
@@ -714,20 +767,18 @@ bool HandleInputCapture(FsContext ctx, const int service_id, void* pData)
 		// Register input capture
 		// Client events reference: http://www.prepar3d.com/SDKv3/LearningCenter/utilities/variables/event_ids.html
 		// Elevator group
-		SimConnect_MapClientEventToSimEvent(hSimConnect, AXIS_ELEVATOR_SET_EVENT, "AXIS_ELEVATOR_SET");
-		SimConnect_AddClientEventToNotificationGroup(hSimConnect, ELEVATOR_GROUP, AXIS_ELEVATOR_SET_EVENT, TRUE);
+		SimConnect_MapClientEventToSimEvent(hSimConnect, ELEVATOR_SET_EVENT, "AXIS_ELEVATOR_SET");
+		SimConnect_AddClientEventToNotificationGroup(hSimConnect, ELEVATOR_GROUP, ELEVATOR_SET_EVENT, TRUE);
 
 		// Aileron group
-		SimConnect_MapClientEventToSimEvent(hSimConnect, AXIS_AILERONS_SET_EVENT, "AXIS_AILERONS_SET");
+		SimConnect_MapClientEventToSimEvent(hSimConnect, AILERONS_SET_EVENT, "AXIS_AILERONS_SET");
 		SimConnect_MapClientEventToSimEvent(hSimConnect, CENTER_AILERONS_RUDDER_EVENT, "CENTER_AILER_RUDDER");
-		SimConnect_AddClientEventToNotificationGroup(hSimConnect, AILERON_GROUP, AXIS_AILERONS_SET_EVENT, TRUE);
+		SimConnect_AddClientEventToNotificationGroup(hSimConnect, AILERON_GROUP, AILERONS_SET_EVENT, TRUE);
 		SimConnect_AddClientEventToNotificationGroup(hSimConnect, AILERON_GROUP, CENTER_AILERONS_RUDDER_EVENT, TRUE);
 
 		// Rudder group
-		SimConnect_MapClientEventToSimEvent(hSimConnect, AXIS_RUDDER_SET_EVENT, "AXIS_RUDDER_SET");
-		SimConnect_MapClientEventToSimEvent(hSimConnect, RUDDER_SET_EVENT, "RUDDER_SET");
+		SimConnect_MapClientEventToSimEvent(hSimConnect, RUDDER_SET_EVENT, "AXIS_RUDDER_SET");
 		SimConnect_MapClientEventToSimEvent(hSimConnect, RUDDER_CENTER_EVENT, "RUDDER_CENTER");
-		SimConnect_AddClientEventToNotificationGroup(hSimConnect, RUDDER_GROUP, AXIS_RUDDER_SET_EVENT, TRUE);
 		SimConnect_AddClientEventToNotificationGroup(hSimConnect, RUDDER_GROUP, RUDDER_SET_EVENT, TRUE);
 		SimConnect_AddClientEventToNotificationGroup(hSimConnect, RUDDER_GROUP, RUDDER_CENTER_EVENT, TRUE);
 
@@ -760,14 +811,14 @@ bool HandleInputCapture(FsContext ctx, const int service_id, void* pData)
  * ====================== *
  */
 
- /*
-  * Describes the current position of the control surfaces
-  */
+/*
+ * Describes the current position of the control surfaces
+ */
 struct CONTROL_SURFACES_DATA
 {
-	double elevator; // -1 is full down, and +1 is full up
-	double aileron; // -1 is full left, and +1 is full right
-	double rudder; // -1 is full left, and +1 is full right
+	double elevator = 0; // -1 is full down, and +1 is full up
+	double aileron = 0; // -1 is full left, and +1 is full right
+	double rudder = 0; // -1 is full left, and +1 is full right
 } control_surfaces;
 
 enum DEFINITION_ID
@@ -789,325 +840,388 @@ double FlightControlSystem_GetUserYokeXPosition()
 	return fabs(user_input.yoke_x) < null_zone_error ? 0 : user_input.yoke_x;
 }
 
-double linearly_reduce_authority(const double zone_position, const double min_zone, const double max_zone)
+struct NORMAL_LAW_PROTECTIONS
 {
-	// At min zone, the effectiveness is maximal
-	// At max zone, the effectiveness is minimal
-	if (min_zone < max_zone)
-	{	
-		// We are working in the positive direction
-		if (zone_position <= max_zone)
+	double maximum_bank_angle = 67; // Maximum bank angle in degrees
+	                                // - Normally: 67 degrees
+	                                // - High Angle of Attack Protection: 45 degrees
+	                                // - High Speed Protection: 45 degrees
+	double nominal_bank_angle = 33; // Spiral static stability in degrees
+	                                // - Normally: 33 degrees
+	                                // - High Angle of Attack Protection: 0 degrees
+	                                // - High Speed Protection: 0 degrees
+	double min_load_factor = -1; // -1g for clean configuration, 0g for other configurations
+	double max_load_factor = 2.5; // 2.5g for clean configuration, 2g for other configurations
+	double max_pitch_angle = 30; // Maximum pitch attitude in degrees
+	                                 // 30 degrees nose up in conf 0-3 (progressively reduced to 25 degrees at low speed)
+	                                 // 25 degrees nose up in conf FULL (progressively reduced to 20 degrees at low speed)
+	                                 // TODO: To implement the 'progressively reduced' limitation, we need to find a way to
+	                                 //       calculate speeds like V_alpha_prot or V_alpha_max, for which I think we will
+	                                 //       have to work out via experimentation.
+	double min_pitch_angle = -15; // Minimum pitch attitude in degrees
+	
+	double last_update = 0; // Last time we updated any of these values
+	bool aoa_demand_active = false;
+	double aoa_demand_deactivation_timer = 0;
+	bool high_speed_protection_active = false;
+} normal_law_protections;
+
+
+void FlightControlSystem_CalculateNormalLawSettings(const double t, const double dt)
+{
+	if (normal_law_protections.last_update != t)
+	{
+		// Do the calculation only if we haven't yet
+		normal_law_protections.last_update = t;
+
+		// Check if we are in AoA demand mode (as dictated by High Angle of Attack Protection)
+		if (normal_law_protections.aoa_demand_active)
 		{
-			return 1.0; // Full effectiveness
-		}
-		else if (zone_position >= max_zone)
-		{
-			return 0.0; // If we've exceeded the max zone, the command effectiveness must be 0.
+			// Should we leave AoA demand mode?
+			// Exit condition 1: Sidestick must be pushed more than 8 degrees forward (assuming this is ~50% down)
+			const auto condition1 = FlightControlSystem_GetUserYokeYPosition() <= -0.5;
+			// Exit condition 2: Sidestick must be pushed more than 0.5 degrees forward for at least 0.5 seconds when alpha < alpha_max
+			const auto condition2 = normal_law_protections.aoa_demand_deactivation_timer >= 0.5;
+			if (condition1 || condition2)
+			{
+				normal_law_protections.aoa_demand_active = false;
+				normal_law_protections.aoa_demand_deactivation_timer = 0;
+			}
+			else if (FlightControlSystem_GetUserYokeYPosition() < 0 && flight_path_data.aoa < GetAlphaMaxAngle())
+			{
+				// We're still building the target duration to meet condition 2
+				normal_law_protections.aoa_demand_deactivation_timer += dt;
+			}
+			else
+			{
+				// We don't match any of the exit conditions
+				normal_law_protections.aoa_demand_deactivation_timer = 0;
+			}
 		}
 		else
 		{
-			return 1.0 - ((zone_position - min_zone) / (max_zone - min_zone));
-		}	
+			// Should we enter AoA demand mode?
+			// Enter condition 1: Sidestick must not be pushed down, and AoA is greater than alpha_prot
+			const auto condition1 = FlightControlSystem_GetUserYokeYPosition() >= 0 && flight_path_data.aoa > GetAlphaProtAngle();
+			// Enter condition 2: We are at or above alpha max
+			const auto condition2 = flight_path_data.aoa >= GetAlphaMaxAngle();
+			if (condition1 || condition2)
+			{
+				normal_law_protections.aoa_demand_active = true;
+				normal_law_protections.aoa_demand_deactivation_timer = 0;
+			}
+		}
+
+		// Check if high speed protection is active
+		normal_law_protections.high_speed_protection_active = flight_path_data.airspeed_indicated > flight_path_data.vmo
+		                                                   || flight_path_data.airspeed_mach > flight_path_data.mmo;
+
+		// Update bank angles
+		if (normal_law_protections.aoa_demand_active || normal_law_protections.high_speed_protection_active)
+		{
+			normal_law_protections.maximum_bank_angle = 45;
+			normal_law_protections.nominal_bank_angle = 0;
+		}
+		else
+		{
+			normal_law_protections.maximum_bank_angle = 67;
+			normal_law_protections.nominal_bank_angle = 33;
+		}
+
+		// Update load and pitch factors
+		switch (flight_path_data.flaps_pos)
+		{
+		case 0:
+			normal_law_protections.min_load_factor = -1;
+			normal_law_protections.max_load_factor = 2.5;
+			normal_law_protections.max_pitch_angle = 30;
+			break;
+		case 1:
+			normal_law_protections.min_load_factor = 0;
+			normal_law_protections.max_load_factor = 2;
+			normal_law_protections.max_pitch_angle = 30;
+			break;
+		case 2:
+			normal_law_protections.min_load_factor = 0;
+			normal_law_protections.max_load_factor = 2;
+			normal_law_protections.max_pitch_angle = 30;
+			break;
+		case 3:
+			normal_law_protections.min_load_factor = 0;
+			normal_law_protections.max_load_factor = 2;
+			normal_law_protections.max_pitch_angle = 30;
+			break;
+		case 4:
+			normal_law_protections.min_load_factor = 0;
+			normal_law_protections.max_load_factor = 2;
+			normal_law_protections.max_pitch_angle = 25;
+			break;
+		default: // Unreachable
+			normal_law_protections.min_load_factor = -1;
+			normal_law_protections.max_load_factor = 2.5;
+			normal_law_protections.max_pitch_angle = 30;
+			break;
+		}
+	}
+}
+
+static PIDController aoa_controller(-2, 2, 0.002, 0, 0.0002); // AoA error -> elevator handle movement rate
+static PIDController gforce_controller(-2, 2, 0.01, 0, 0); // GForce error -> elevator handle movement rate
+static PIDController speed_knots_controller(-0.1, 0.1, -0.001, 0, -0.0001); // Knots speed error -> elevator handle movement rate
+static PIDController speed_mach_controller(-0.1, 0.1, -0.001, 0, -0.0001); // Mach speed error -> elevator handle movement rate
+static PIDController vertical_fpa_controller(-2, 2, 0.04, 0.001, 0.1); // Vertical FPA error -> elevator handle movement rate
+static PIDController pitch_angle_controller(-2, 2, 0.005, 0, 0.0002); // Pitch angle error -> elevator handle movement rate
+static PIDController pitch_rate_controller(-2, 2, 0.006, 0, 0.0008); // Pitch rate error -> elevator handle movement rate
+
+double pitch_hold_time = 0;
+double held_vertical_fpa = 0;
+double FlightControlSystem_LoadFactorLimitation(double const elevator_position_change, const double dt)
+{
+	const auto clamping_zone = 0.25; // When we're within 0.25g of our LF limitations, reduce elevator authority
+	
+	if (flight_path_data.gforce > normal_law_protections.max_load_factor)
+	{
+		const auto proposed_elevator_position_change = gforce_controller.Update(normal_law_protections.max_load_factor - flight_path_data.gforce, dt);
+		const auto new_elevator_position_change = min(elevator_position_change, proposed_elevator_position_change);
+		printf(", LF_MAX_VIOL: LF = %lf, PreElevD = %lf, PostElevD = %lf", flight_path_data.gforce, elevator_position_change, new_elevator_position_change);
+		return new_elevator_position_change;
+	}
+	else if (flight_path_data.gforce < normal_law_protections.min_load_factor)
+	{
+		const auto proposed_elevator_position_change = gforce_controller.Update(normal_law_protections.min_load_factor - flight_path_data.gforce, dt);
+		const auto new_elevator_position_change = max(elevator_position_change, proposed_elevator_position_change);
+		printf(", LF_MIN_VIOL: LF = %lf, PreElevD = %lf, PostElevD = %lf", flight_path_data.gforce, elevator_position_change, new_elevator_position_change);
+		return new_elevator_position_change;
+	}
+	else if (flight_path_data.gforce + clamping_zone >= normal_law_protections.max_load_factor && elevator_position_change >= 0)
+	{
+		const auto new_elevator_position_change = elevator_position_change * linear_decay_coefficient(flight_path_data.gforce, normal_law_protections.max_load_factor - clamping_zone, normal_law_protections.max_load_factor);
+		printf(", LF_MAX: LF = %lf, PreElevD = %lf, PostElevD = %lf", flight_path_data.gforce, elevator_position_change, new_elevator_position_change);
+		return new_elevator_position_change;
+	}
+	else if (flight_path_data.gforce - clamping_zone <= normal_law_protections.min_load_factor && elevator_position_change <= 0)
+	{
+		const auto new_elevator_position_change = elevator_position_change * linear_decay_coefficient(flight_path_data.gforce, normal_law_protections.min_load_factor + clamping_zone, normal_law_protections.min_load_factor);
+		printf(", LF_MIN: LF = %lf, PreElevD = %lf, PostElevD = %lf", flight_path_data.gforce, elevator_position_change, new_elevator_position_change);
+		return new_elevator_position_change;
 	}
 	else
 	{
-		// We are working in the negative direction
-		if (zone_position >= min_zone)
-		{
-			return 1.0; // Full effectiveness
-		}
-		else if (zone_position <= max_zone)
-		{
-			return 0.0; // Minimal effectiveness
-		}
-		else
-		{
-			return 1.0 - ((zone_position - min_zone) / (max_zone - min_zone));
-		}
+		return elevator_position_change;
 	}
 }
 
-double pitch_angle = 0;
-double pitch_stable_time = 0;
-struct AOA_PROTECTIONS
+double FlightControlSystem_HighSpeedProtection(double const elevator_position_change, const double dt)
 {
-	bool in_aoa_mode = false;
-	double last_update = 0;
-	double aoa_deactivate_time = 0;
-	double requested_aoa = 0;
-} aoa_prot;
-
-bool InAngleOfAttackProtectionMode(const double t, const double dt)
-{
-	if (aoa_prot.last_update != t)
+	if (normal_law_protections.high_speed_protection_active)
 	{
-		// Update protection info only if we haven't already calculated it this cycle
-		aoa_prot.last_update = t;
-		if (aoa_prot.in_aoa_mode)
+		pitch_hold_time = 0;
+		
+		auto user_elevator_position_change = elevator_position_change;
+		if (elevator_position_change < 0)
 		{
-			pitch_stable_time = 0;
-			
-			// Should we leave AoA mode?
-			// Exit condition 1: Sidestick must be pushed more than 8 degrees forward (assuming this is ~50% down)
-			if (FlightControlSystem_GetUserYokeYPosition() == -0.5)
+			// The FCOM says "As the speed increases above VMO/MMO, the sidestick nose-down authority is progressively reduced"
+			// Let's make the user have no authority above Vmo + 8, Mmo + 0.012 (arbitrarily chosen)
+			// We'll pick whichever path leaves the user with the least control
+			const auto user_elevator_position_change_knots = elevator_position_change * linear_decay_coefficient(flight_path_data.airspeed_indicated, flight_path_data.vmo, flight_path_data.vmo + 8);
+			const auto user_elevator_position_change_mach = elevator_position_change * linear_decay_coefficient(flight_path_data.airspeed_mach, flight_path_data.mmo, flight_path_data.mmo + 0.012);
+			user_elevator_position_change = max(user_elevator_position_change_knots, user_elevator_position_change_mach);
+		}
+		
+		// Now let's get the nose-up input necessary from the speed controller (we'll use knots)
+		// We'll aim the speed for Vmo - 1, Mmo - 0.0015 (arbitrarily chosen)
+		// We'll pick whichever path gives the most positive input
+		const auto pitch_up_elevator_position_change_knots = speed_knots_controller.Update((flight_path_data.vmo - 1) - flight_path_data.airspeed_indicated, dt);
+		const auto pitch_up_elevator_position_change_mach = speed_mach_controller.Update((flight_path_data.mmo - 0.0015) - flight_path_data.airspeed_mach, dt);
+		const auto pitch_up_elevator_position_change = max(pitch_up_elevator_position_change_knots, pitch_up_elevator_position_change_mach);
+
+		// Let's blend the two together
+		const auto new_elevator_position_change = user_elevator_position_change + pitch_up_elevator_position_change;
+		printf(", OVERSPD: PreElevD = %lf, UserRedElevD = %lf, PitchUpElevD = %lf, PostElevD = %lf", elevator_position_change, user_elevator_position_change, pitch_up_elevator_position_change, new_elevator_position_change);
+
+		return new_elevator_position_change;
+	}
+	else
+	{
+		return elevator_position_change;
+	}
+}
+
+double FlightControlSystem_PitchAttitudeProtection(double const elevator_position_change, const double dt)
+{
+	const auto clamping_zone = 5; // When we're within 5 degrees of our pitch limitations, reduce authority
+	const auto max_pitch_rate = 5; // Max degrees per second when approaching our clamping zone
+
+	if (flight_path_data.pitch > normal_law_protections.max_pitch_angle)
+	{
+		const auto proposed_elevator_position_change = pitch_angle_controller.Update(normal_law_protections.max_pitch_angle - flight_path_data.pitch, dt);
+		const auto new_elevator_position_change = min(elevator_position_change, proposed_elevator_position_change);
+		printf(", PITCH_MAX_VIOL: Pitch = %lf, PreElevD = %lf, PostElevD = %lf", flight_path_data.pitch, elevator_position_change, new_elevator_position_change);
+		return new_elevator_position_change;
+	}
+	else if (flight_path_data.pitch < normal_law_protections.min_pitch_angle)
+	{
+		const auto proposed_elevator_position_change = pitch_angle_controller.Update(normal_law_protections.min_pitch_angle - flight_path_data.pitch, dt);
+		const auto new_elevator_position_change = max(elevator_position_change, proposed_elevator_position_change);
+		printf(", PITCH_MIN_VIOL: Pitch = %lf, PreElevD = %lf, PostElevD = %lf", flight_path_data.pitch, elevator_position_change, new_elevator_position_change);
+		return new_elevator_position_change;
+	}
+	else if (flight_path_data.pitch + clamping_zone >= normal_law_protections.max_pitch_angle && elevator_position_change >= 0)
+	{
+		// Add some corrective position change if we are approaching the pitch limit too quickly
+		double corrective_elevator_position_change = 0;
+		const auto max_pitch_rate_allowed = max_pitch_rate * linear_decay_coefficient(flight_path_data.pitch, normal_law_protections.max_pitch_angle - clamping_zone, normal_law_protections.max_pitch_angle);
+		if (flight_path_data.pitch_rate > max_pitch_rate_allowed) {
+			corrective_elevator_position_change = pitch_rate_controller.Update(max_pitch_rate_allowed - flight_path_data.pitch_rate, dt);
+		}
+
+		// Linearly reduce user nose up authority
+		const auto user_elevator_position_change = elevator_position_change * linear_decay_coefficient(flight_path_data.pitch, normal_law_protections.max_pitch_angle - clamping_zone, normal_law_protections.max_pitch_angle);
+		const auto new_elevator_position_change = user_elevator_position_change + corrective_elevator_position_change;
+		
+		printf(", PITCH_MAX: Pitch = %lf, PreElevD = %lf, UserElevD = %lf, CorElevD = %lf, PostElevD = %lf", flight_path_data.pitch, elevator_position_change, user_elevator_position_change, corrective_elevator_position_change, new_elevator_position_change);
+		return new_elevator_position_change;
+	}
+	else if (flight_path_data.pitch - clamping_zone <= normal_law_protections.min_pitch_angle && elevator_position_change <= 0)
+	{
+		// Add some corrective position change if we are approaching the pitch limit too quickly
+		double corrective_elevator_position_change = 0;
+		const auto min_pitch_rate_allowed = -max_pitch_rate * linear_decay_coefficient(flight_path_data.pitch, normal_law_protections.min_pitch_angle + clamping_zone, normal_law_protections.min_pitch_angle);
+		if (flight_path_data.pitch_rate < min_pitch_rate_allowed) {
+			corrective_elevator_position_change = pitch_rate_controller.Update(min_pitch_rate_allowed - flight_path_data.pitch_rate, dt);
+		}
+		
+		const auto user_elevator_position_change = elevator_position_change * linear_decay_coefficient(flight_path_data.pitch, normal_law_protections.min_pitch_angle + clamping_zone, normal_law_protections.min_pitch_angle);
+		const auto new_elevator_position_change = user_elevator_position_change + corrective_elevator_position_change;
+		printf(", PITCH_MIN: Pitch = %lf, PreElevD = %lf, UserElevD = %lf, CorElevD = %lf, PostElevD = %lf", flight_path_data.pitch, elevator_position_change, user_elevator_position_change, corrective_elevator_position_change, new_elevator_position_change);
+		return new_elevator_position_change;
+	}
+	else
+	{
+		return elevator_position_change;
+	}
+}
+
+double FlightControlSystem_FlightModePitchControl(const double t, const double dt)
+{
+	double elevator_position_change;
+
+	if (normal_law_protections.aoa_demand_active)
+	{
+		pitch_hold_time = 0;
+
+		// AoA demand mode
+		const auto commanded_aoa = FlightControlSystem_GetUserYokeYPosition() >= 0 ?
+			// Neutral -> Full Up = AoA proportional range from alpha_prot -> alpha_max
+			linear_range(FlightControlSystem_GetUserYokeYPosition(), GetAlphaProtAngle(), GetAlphaMaxAngle())
+			// Neutral -> Full Down = AoA proportional range from alpha_prot -> 0 AoA
+			: linear_range(FlightControlSystem_GetUserYokeYPosition(), GetAlphaProtAngle(), 0);
+		elevator_position_change = aoa_controller.Update(commanded_aoa - flight_path_data.aoa, dt);
+		printf("AOA: AoA = %lf, CmdAoA = %lf", flight_path_data.aoa, commanded_aoa);
+
+		// Apply protections
+		elevator_position_change = FlightControlSystem_LoadFactorLimitation(elevator_position_change, dt);
+		elevator_position_change = FlightControlSystem_PitchAttitudeProtection(elevator_position_change, dt);
+	}
+	else
+	{
+		// Load factor demand mode
+		if (FlightControlSystem_GetUserYokeXPosition() == 0 && FlightControlSystem_GetUserYokeYPosition() == 0)
+		{
+			// Neutral x and y = Hold FPA
+			if (pitch_hold_time < 5)
 			{
-				aoa_prot.in_aoa_mode = false;
-				aoa_prot.aoa_deactivate_time = 0;
+				// Hold the current pitch for 5 seconds to allow VFPA to stabilize
+				elevator_position_change = pitch_rate_controller.Update(0 - flight_path_data.pitch_rate, dt);
+				printf("HOLD_PITCH: Pitch = %lf, PitchRate = %lf", flight_path_data.pitch, flight_path_data.pitch_rate);
+				held_vertical_fpa = flight_path_data.vertical_fpa;
+				pitch_hold_time += dt;
 			}
-			// Exit condition 2: Sidestick must be pushed more than 0.5 degrees forward for at least 0.5 seconds when alpha < alpha_max
-			else if (FlightControlSystem_GetUserYokeYPosition() < 0 && flight_path_data.aoa < GetAlphaMaxAngle())
+			else
 			{
-				aoa_prot.aoa_deactivate_time += dt;
-				if (aoa_prot.aoa_deactivate_time >= 0.5)
+				// Hold the VFPA
+				elevator_position_change = vertical_fpa_controller.Update(held_vertical_fpa - flight_path_data.vertical_fpa, dt);
+				printf("HOLD_VFPA: Pitch = %lf, PitchRate = %lf, VFPA = %lf, DesVFPA = %lf, VFPAErr = %lf, VFPARate = %lf", flight_path_data.pitch, flight_path_data.pitch_rate, flight_path_data.vertical_fpa, held_vertical_fpa, held_vertical_fpa - flight_path_data.vertical_fpa, flight_path_data.vertical_fpa_rate);
+			}
+		}
+		else
+		{
+			pitch_hold_time = 0;
+			if (FlightControlSystem_GetUserYokeYPosition() == 0)
+			{
+				if (fabs(flight_path_data.roll) > normal_law_protections.nominal_bank_angle)
 				{
-					aoa_prot.in_aoa_mode = false;
-					aoa_prot.aoa_deactivate_time = 0;
+					// Neutral y, but we're rolling and bank angle is greater than our nominal bank angle = Drop pitch to 1G LF
+					elevator_position_change = gforce_controller.Update(1 - flight_path_data.gforce, dt);
+					printf("ROLL_1G: Pitch = %lf, PR = %lf, CurrLF = %lf", flight_path_data.pitch, flight_path_data.pitch_rate, flight_path_data.gforce);
+				}
+				else
+				{
+					// Neutral y, but we're rolling and bank angle is less than our nominal bank angle = Hold pitch
+					elevator_position_change = pitch_rate_controller.Update(0 - flight_path_data.pitch_rate, dt);
+					printf("HOLD_PITCH: Pitch = %lf, PitchRate = %lf", flight_path_data.pitch, flight_path_data.pitch_rate);
 				}
 			}
-			// Exit condition 3: alpha < alpha_prot
-			else if (flight_path_data.aoa < GetAlphaProtAngle())
+			else
 			{
-				aoa_prot.in_aoa_mode = false;
-				aoa_prot.aoa_deactivate_time = 0;
+				// Determine the normal load factor for our bank angle
+				const auto normal_load_factor = 1 / cos(radians(flight_path_data.roll));
+
+				// Determine the user's requested load factor
+				const auto requested_load_factor = FlightControlSystem_GetUserYokeYPosition() >= 0 ?
+					linear_range(FlightControlSystem_GetUserYokeYPosition(), normal_load_factor, normal_law_protections.max_load_factor)
+					: linear_range(-FlightControlSystem_GetUserYokeYPosition(), normal_load_factor, normal_law_protections.min_load_factor);
+
+				elevator_position_change = gforce_controller.Update(requested_load_factor - flight_path_data.gforce, dt);
+				printf("CMD_LF: LF = %lf, DesLF = %lf", flight_path_data.gforce, requested_load_factor);
 			}
 		}
-		else
-		{
-			// Should we enter AoA mode?
-			// Enter condition 1: Sidestick must not be pushed down, and AoA is greater than alpha prot
-			if (FlightControlSystem_GetUserYokeYPosition() >= 0 && flight_path_data.aoa > GetAlphaProtAngle())
-			{
-				pitch_stable_time = 0;
-				aoa_prot.in_aoa_mode = true;
-				aoa_prot.requested_aoa = clamp(flight_path_data.aoa, flight_path_data.aoa, GetAlphaMaxAngle());
-			}
-			// Enter condition 2: We are at or above alpha max
-			else if (flight_path_data.aoa >= GetAlphaMaxAngle())
-			{
-				pitch_stable_time = 0;
-				aoa_prot.in_aoa_mode = true;
-				aoa_prot.requested_aoa = clamp(flight_path_data.aoa, flight_path_data.aoa, GetAlphaMaxAngle());
-			}
-		}
+
+		// Apply protections
+		elevator_position_change = FlightControlSystem_HighSpeedProtection(elevator_position_change, dt);
+		elevator_position_change = FlightControlSystem_LoadFactorLimitation(elevator_position_change, dt);
+		elevator_position_change = FlightControlSystem_PitchAttitudeProtection(elevator_position_change, dt);
 	}
-	return aoa_prot.in_aoa_mode;
+	return elevator_position_change;
 }
 
-double FlightControlSystem_ApplyLoadFactorLimitation(double commanded_pitch_rate)
+double FlightControlSystem_FlareModePitchControl(const double t, const double dt)
 {
-	const auto clamping_zone = 0.25;
-	const auto maximum_load_factor = 2.5; // TODO: Handle other configurations
-	const auto minimum_load_factor = -1.0; // TODO: Handle other configurations
+	// From the FCOM
+	// "The system memorizes the attitude at 50 feet, and that attitude becomes the initial
+	// reference for pitch attitude control."
+	// We saved that variable as 'saved_flare_pitch_attitude'.
+	// Honestly, I can't see why it is saved though.
 
-	if (flight_path_data.gforce > maximum_load_factor && commanded_pitch_rate >= 0)
+	// From the FCOM
+	// "As the aircraft descends through 30 feet, the system begins to reduce the pitch attitude,
+	// reducing it to 2 degrees nose down over a period of 8 seconds. This means that it takes
+	// gentle nose-up action by the pilot to flare the aircraft."
+
+	// Let's make flare mode just a pitch rate mode
+	auto commanded_pitch_rate = 5 * FlightControlSystem_GetUserYokeYPosition(); // 5 degrees/sec at maximum deflection
+	if (flight_path_data.radio_height <= 30)
 	{
-		pitch_stable_time = 0;
-		printf(",LF_PROT_HIGH_VIOL: LF = %lf", flight_path_data.gforce);
-		commanded_pitch_rate = -1; // Reduce pitch by 1 degree/second to move back within the flight envelope
+		commanded_pitch_rate -= 2.0 / 8.0; // 2 degrees nose down per 8 seconds
 	}
-	else if (flight_path_data.gforce < minimum_load_factor && commanded_pitch_rate <= 0)
-	{
-		pitch_stable_time = 0;
-		printf(",LF_PROT_LOW_VIOL: LF = %lf", flight_path_data.gforce);
-		commanded_pitch_rate = 1; // Increase pitch by 1 degree/second to move back within the flight envelope
-	}
-	else if (flight_path_data.gforce >= (maximum_load_factor - clamping_zone) && commanded_pitch_rate > 0)
-	{
-		pitch_stable_time = 0;
-		printf(",LF_PROT_HIGH: LF = %lf", flight_path_data.gforce);
-		commanded_pitch_rate *= linearly_reduce_authority(flight_path_data.gforce, maximum_load_factor - clamping_zone, maximum_load_factor);
-	}
-	else if (flight_path_data.gforce < (minimum_load_factor + clamping_zone) && commanded_pitch_rate < 0)
-	{
-		pitch_stable_time = 0;
-		printf(",LF_PROT_LOW: LF = %lf", flight_path_data.gforce);
-		commanded_pitch_rate *= linearly_reduce_authority(flight_path_data.gforce, minimum_load_factor + clamping_zone, minimum_load_factor);
-	}
-	return commanded_pitch_rate;
+
+	return pitch_rate_controller.Update(commanded_pitch_rate - flight_path_data.pitch_rate, dt);
 }
 
-double FlightControlSystem_ApplyPitchAttitudeProtection(double commanded_pitch_rate)
-{
-	const auto clamping_zone = 5;
-	const auto maximum_pitch = 30; // TODO: Handle other configurations
-	const auto minimum_pitch = -15; // TODO: Handle other configurations
 
-	if (flight_path_data.pitch > maximum_pitch && commanded_pitch_rate >= 0)
-	{
-		// Reduce pitch by up to 1 degree/second to move back within the flight envelope
-		printf(",TOO_HIGH_VIOL");
-		commanded_pitch_rate = -1 * linearly_reduce_authority(flight_path_data.pitch, maximum_pitch + 1, maximum_pitch);
-	}
-	else if (flight_path_data.pitch < minimum_pitch && commanded_pitch_rate <= 0)
-	{
-		// Increase pitch by up to 1 degree/second to move back within the flight envelope
-		printf(",TOO_LOW_VIOL");
-		commanded_pitch_rate = 1 * linearly_reduce_authority(flight_path_data.pitch, minimum_pitch - 1, minimum_pitch);
-	}
-	else if (flight_path_data.pitch >= (maximum_pitch - clamping_zone) && commanded_pitch_rate > 0)
-	{
-		printf(",TOO_HIGH");
-		commanded_pitch_rate *= linearly_reduce_authority(flight_path_data.pitch, maximum_pitch - clamping_zone, maximum_pitch);
-	}
-	else if (flight_path_data.pitch <= (minimum_pitch + clamping_zone) && commanded_pitch_rate < 0)
-	{
-		printf(",TOO_LOW");
-		commanded_pitch_rate *= linearly_reduce_authority(flight_path_data.pitch, minimum_pitch + clamping_zone, minimum_pitch);
-	}
-	return commanded_pitch_rate;
-}
-
-double FlightControlSystem_ApplyHighSpeedProtection(double commanded_pitch_rate)
-{
-	//printf("AirSpd = %lf, Mach = %lf, Vmo = %lf, Mmo = %lf,", flight_path_data.airspeed_indicated, flight_path_data.airspeed_mach, flight_path_data.vmo, flight_path_data.mmo);
-	if (flight_path_data.airspeed_indicated >= flight_path_data.vmo || flight_path_data.airspeed_mach >= flight_path_data.mmo)
-	{
-		pitch_stable_time = 0;
-		if (FlightControlSystem_GetUserYokeYPosition() < 0)
-		{
-			// Linearly reduce elevator down authority as speed increases
-			auto vmo_effectiveness = linearly_reduce_authority(flight_path_data.airspeed_indicated, flight_path_data.vmo, flight_path_data.vmo + 4);
-			auto mmo_effectiveness = linearly_reduce_authority(flight_path_data.airspeed_mach, flight_path_data.mmo, flight_path_data.mmo + 0.006);
-			auto effectiveness = min(vmo_effectiveness, mmo_effectiveness);
-			commanded_pitch_rate *= effectiveness;
-		}
-		// Add a positive pitch rate to encourage the nose to come up
-		auto vmo_effectiveness = linearly_reduce_authority(flight_path_data.airspeed_indicated, flight_path_data.vmo + 4, flight_path_data.vmo);
-		auto mmo_effectiveness = linearly_reduce_authority(flight_path_data.airspeed_mach, flight_path_data.mmo + 0.006, flight_path_data.mmo);
-		auto effectiveness = max(vmo_effectiveness, mmo_effectiveness);
-		commanded_pitch_rate += 3 * effectiveness; // TODO: Tuning?
-		printf("OVERSPD");
-	}
-	return commanded_pitch_rate;
-}
-
-static PIDController aoa_controller(-5, 5, 4, 0, 0.1);
-static PIDController gforce_rate_controller(-10, 10, 16, 0, 0);
-static PIDController hold_vertical_fpa_rate_controller(-3, 3, 16, 16, 1);
-static PIDController hold_pitch_controller(-2, 2, 6, 0, 1);
-static AntiWindupPIDController pitch_rate_controller(-1, 1, 0.32, 0.32, 0.005);
 void FlightControlSystem_ManagePitchControl(const double t, const double dt)
 {
 	// TODO: Handle other laws
-	if (pitch_control_mode == FLIGHT_MODE)
+	FlightControlSystem_CalculateNormalLawSettings(t, dt);
+
+	if (pitch_control_mode == FLIGHT_MODE || pitch_control_mode == FLARE_MODE)
 	{
-		double commanded_pitch_rate;
-		
-		if (InAngleOfAttackProtectionMode(t, dt))
-		{
-			// AoA demand mode
-			// Kicks in when angle of attack becomes grater than alpha_prot
-			// - Stick commands AoA between alpha_prot to alpha_max
-			// - alpha_prot < alpha_floor < alpha_max < alpha_cl_max = 1G stall
-			// To deactivate AoA protection:
-			// - Sidestick must be pushed more than 8 degrees forward, or;
-			// - Sidestick must be pushed more than 0.5 degrees forward for at least 0.5 seconds when alpha < alpha_max
-			const auto max_aoa_rate = 5; // Maximum sidestick effectiveness in changing AoA. TODO: Tuning?
-			const auto aoa_change = max_aoa_rate * FlightControlSystem_GetUserYokeYPosition() * dt;
-			if (aoa_change == 0)
-			{
-				// When sidestick is released, the angle of attack returns to alpha prot
-				aoa_prot.requested_aoa = GetAlphaProtAngle();
-			}
-			else
-			{
-				// Otherwise, we are just commanding an AoA change.
-				aoa_prot.requested_aoa += aoa_change;
-			}
-			aoa_prot.requested_aoa = clamp(aoa_prot.requested_aoa, aoa_prot.requested_aoa, GetAlphaMaxAngle());
-			printf("AOA: AA = %lf, CmdAA = %lf, AlphaProt = %lf, AlphaMax = %lf, AlphaStall = %lf", flight_path_data.aoa, aoa_prot.requested_aoa, GetAlphaProtAngle(), GetAlphaMaxAngle(), flight_path_data.stall_alpha);
-			commanded_pitch_rate = aoa_controller.Update(aoa_prot.requested_aoa - flight_path_data.aoa, dt);
-			commanded_pitch_rate = FlightControlSystem_ApplyLoadFactorLimitation(commanded_pitch_rate);
-
-			// Reset controllers not being used
-			gforce_rate_controller.Reset();
-			hold_vertical_fpa_rate_controller.Reset();
-
-			// Reset pitch stability indicator
-			pitch_stable_time = 0;
-		}
-		else
-		{
-			// Load factor demand
-			if (FlightControlSystem_GetUserYokeYPosition() == 0 && FlightControlSystem_GetUserYokeXPosition() == 0)
-			{				
-				// Neutral x and y = Hold FPA
-				if (pitch_stable_time == 0)
-				{
-					pitch_angle = flight_path_data.pitch + flight_path_data.pitch_rate * dt * 30; // Assume it'll take 30 cycles to stabilize the pitch
-				}
-				
-				if (pitch_stable_time < 5)
-				{
-					printf("HOLD_PITCH: Pitch = %lf, PR = %lf", flight_path_data.pitch, flight_path_data.pitch_rate);
-					commanded_pitch_rate = hold_pitch_controller.Update(pitch_angle - flight_path_data.pitch, dt);
-					pitch_stable_time += dt;
-					
-					// Reset controllers not being used
-					hold_vertical_fpa_rate_controller.Reset();
-				}
-				else
-				{					
-					// Hold FPA
-					printf("HOLD_VFPA: VFPA = %lf, VFPARate = %lf", flight_path_data.vertical_fpa, flight_path_data.vertical_fpa_rate);
-					commanded_pitch_rate = hold_vertical_fpa_rate_controller.Update(0 - flight_path_data.vertical_fpa_rate, dt);
-				}
-
-				// Reset controllers not being used
-				aoa_controller.Reset();
-				gforce_rate_controller.Reset();
-			}
-			else if (FlightControlSystem_GetUserYokeYPosition() == 0)
-			{
-				if (fabs(flight_path_data.roll) > 33)
-				{					
-					// Neutral y, but we're rolling and bank angle is > 33 degrees = Drop pitch to 1G LF
-					printf("ROLL_1G: CurLF = %lf", flight_path_data.gforce);
-					commanded_pitch_rate = gforce_rate_controller.Update(1 - flight_path_data.gforce, dt);
-				}
-				else
-				{
-					// Neutral y, but we're rolling and bank angle is <= 33 degrees = Hold pitch
-					printf("HOLD_PITCH: Pitch = %lf, PR = %lf", flight_path_data.pitch, flight_path_data.pitch_rate);
-					commanded_pitch_rate = 0;
-					
-					// Reset controllers not being used
-					gforce_rate_controller.Reset();
-				}
-				
-				// Reset controllers not being used
-				aoa_controller.Reset();
-				hold_vertical_fpa_rate_controller.Reset();
-
-				// Reset pitch stability indicator
-				pitch_stable_time = 0;
-			}
-			else
-			{				
-				// Determine the normal load factor
-				auto normal_load_factor = 1 / cos(radians(flight_path_data.roll));
-
-				// Determine the user's load factor
-				auto requested_load_factor = 2 * FlightControlSystem_GetUserYokeYPosition() + normal_load_factor; // Linear relationship between request and actual value
-				requested_load_factor = clamp(requested_load_factor, -1, 2.5); // TODO: Adjust bounds for different configurations
-				printf("CMD_LF: LF = %lf, ReqLF = %lf", flight_path_data.gforce, requested_load_factor);
-
-				// Command LF
-				commanded_pitch_rate = gforce_rate_controller.Update(requested_load_factor - flight_path_data.gforce, dt);
-
-				// Reset pitch stability indicator
-				pitch_stable_time = 0;
-			}
-
-			// Apply protections
-			commanded_pitch_rate = FlightControlSystem_ApplyHighSpeedProtection(commanded_pitch_rate);
-			commanded_pitch_rate = FlightControlSystem_ApplyLoadFactorLimitation(commanded_pitch_rate);
-			commanded_pitch_rate = FlightControlSystem_ApplyPitchAttitudeProtection(commanded_pitch_rate);
-		}
-		
-		// Apply changes to the elevator
-		control_surfaces.elevator = pitch_rate_controller.Update(commanded_pitch_rate - flight_path_data.pitch_rate, dt);
-		printf("Pitch = %lf, PR = %lf, DesPR = %lf, Elev = %lf\n", flight_path_data.pitch, flight_path_data.pitch_rate, commanded_pitch_rate, control_surfaces.elevator);
+		const auto flight_mode_effect = pitch_control_mode_flight_effect * FlightControlSystem_FlightModePitchControl(t, dt);
+		const auto flare_mode_effect = pitch_control_mode_flare_effect * FlightControlSystem_FlareModePitchControl(t, dt);
+		const auto elevator_position_change = flight_mode_effect + flare_mode_effect;
+		control_surfaces.elevator += elevator_position_change;
+		control_surfaces.elevator = clamp(control_surfaces.elevator, -1, 1);
+		printf(", ElevD = %lf, Elev = %lf\n", elevator_position_change, control_surfaces.elevator);
 	}
 	else
 	{
@@ -1117,33 +1231,33 @@ void FlightControlSystem_ManagePitchControl(const double t, const double dt)
 
 double roll_angle = 0; // The desired bank angle
 static PIDController roll_controller(-1, 1, 0.10, 0, 0.02);
-void FlightControlSystem_ManageRollControl(const double dt)
+void FlightControlSystem_ManageRollControl(const double t, const double dt)
 {
 	// TODO: Handle other laws
+	FlightControlSystem_CalculateNormalLawSettings(t, dt);
 	if (pitch_control_mode == FLIGHT_MODE)
 	{
-		auto maximum_bank_angle = 67; // Maximum bank angle // TODO: Change this when other kinds of protections are active
-		auto nominal_bank_angle = 33; // Spiral static stability // TODO: Change this when other kinds of protections are active
-		
-		if (flight_path_data.airspeed_indicated > flight_path_data.vmo || flight_path_data.airspeed_mach > flight_path_data.mmo)
+		if (flight_path_data.aoa >= GetAlphaProtAngle())
 		{
-			// High-speed protection
-			// Positive spiral static stability reduces to 0 degrees
-			// Bank angle limit is reduced to 45 degrees
-			maximum_bank_angle = 45;
-			nominal_bank_angle = 0;
+			// High AoA weights - justification: ailerons are less effective at high AoA and so it's easier to overshoot
+			roll_controller.Modify(-0.25, 0.25, 0.05, 0, 0.01);
 		}
-
+		else
+		{
+			// Normal AoA weights
+			roll_controller.Modify(-1, 1, 0.10, 0, 0.02);
+		}
+		
 		if (FlightControlSystem_GetUserYokeXPosition() == 0)
 		{
 			// If we are banked beyond the nominal bank angle, roll back to the nominal bank angle
-			if (fabs(flight_path_data.roll) > nominal_bank_angle)
+			if (fabs(roll_angle) > normal_law_protections.nominal_bank_angle)
 			{
 				// Roll opposite at a rate of up to 5 degrees/second
-				roll_angle += 5 * -sign(flight_path_data.roll) * dt;
-				if (fabs(roll_angle) < nominal_bank_angle)
+				roll_angle += 5 * -sign(roll_angle) * dt;
+				if (fabs(roll_angle) < normal_law_protections.nominal_bank_angle)
 				{
-					roll_angle = sign(flight_path_data.roll) * nominal_bank_angle;
+					roll_angle = sign(roll_angle) * normal_law_protections.nominal_bank_angle;
 				}
 			}
 			// We should be holding the specified roll angle
@@ -1152,9 +1266,9 @@ void FlightControlSystem_ManageRollControl(const double dt)
 		{
 			// We should be responsive to the user's roll request
 			roll_angle += 15 * FlightControlSystem_GetUserYokeXPosition() * dt; // 15 degrees/sec at maximum deflection
-			roll_angle = clamp(roll_angle, -maximum_bank_angle, maximum_bank_angle);
+			roll_angle = clamp(roll_angle, -normal_law_protections.maximum_bank_angle, normal_law_protections.maximum_bank_angle);
 		}
-		
+
 		control_surfaces.aileron = roll_controller.Update(roll_angle - flight_path_data.roll, dt);
 		//printf("Roll: CurRoll = %lf, DesRoll = %lf, Error = %lf, Rate = %lf, Ailerons = %lf\n", flight_path_data.roll, roll_angle, roll_angle - flight_path_data.roll, flight_path_data.roll_rate, control_surfaces.aileron);
 	}
@@ -1191,7 +1305,7 @@ bool HandleControlSurfaces(FsContext ctx, const int service_id, void* pData)
 		auto dt = p_draw_data->dt;
 		if (!flight_path_data.autopilot_enabled) {
 			FlightControlSystem_ManagePitchControl(t, dt);
-			FlightControlSystem_ManageRollControl(dt);
+			FlightControlSystem_ManageRollControl(t, dt);
 			control_surfaces.rudder = user_input.rudder;
 		}
 		else

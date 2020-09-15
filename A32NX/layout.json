@@ -607,8 +607,8 @@
         },
         {
             "path": "SimObjects/AirPlanes/Asobo_A320_NEO/flight_model.cfg",
-            "size": 27583,
-            "date": 132445198024238518
+            "size": 27587,
+            "date": 132445829549413664
         },
         {
             "path": "SimObjects/AirPlanes/Asobo_A320_NEO/runway.FLT",
@@ -647,8 +647,8 @@
         },
         {
             "path": "SimObjects/AirPlanes/Asobo_A320_NEO/panel/A32NX.wasm",
-            "size": 101100,
-            "date": 132445422407053346
+            "size": 107103,
+            "date": 132446079605035908
         },
         {
             "path": "SimObjects/AirPlanes/Asobo_A320_NEO/panel/panel.cfg",

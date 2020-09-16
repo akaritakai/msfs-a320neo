@@ -2,32 +2,32 @@
     "dependencies": [
         {
             "name": "asobo-aircraft-a320-neo",
-            "package_version": "0.1.51"
+            "package_version": "0.1.53"
         },
         {
             "name": "asobo-vcockpits-instruments-a320-neo",
-            "package_version": "0.1.38"
+            "package_version": "0.1.43"
         },
         {
             "name": "asobo-vcockpits-instruments-airliners",
-            "package_version": "0.1.13"
+            "package_version": "0.1.43"
         },
         {
             "name": "fs-base-aircraft-common",
-            "package_version": "0.1.61"
+            "package_version": "0.1.63"
         }
     ],
     "content_type": "AIRCRAFT",
     "title": "A320NX",
     "manufacturer": "Airbus",
     "creator": "Iceman",
-    "package_version": "0.1.51",
-    "minimum_game_version": "1.7.12",
+    "package_version": "0.1.53",
+    "minimum_game_version": "1.8.2",
     "release_notes": {
         "neutral": {
             "LastUpdate": "",
             "OlderHistory": ""
         }
     },
-    "total_package_size": "00000000000106694976"
+    "total_package_size": "00000000000000048858"
 }
